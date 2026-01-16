@@ -17,7 +17,7 @@ from app.services.constants import (
     REQUEST_STATUS_REJECTED,
     REQUEST_STATUS_RECEIVED,
 )
-from app.services.attachments import build_photo_groups
+from app.services.attachments import build_photo_groups_from, fetch_request_media
 from app.services.excel import (
     build_daily_requests_xlsx,
     build_employee_stats_xlsx,
@@ -136,7 +136,8 @@ async def assign_executor(callback: CallbackQuery) -> None:
             format_request_summary(request),
             reply_markup=_executor_keyboard_for_request(request),
         )
-        photo_groups = build_photo_groups(request)
+        items, attachments = await fetch_request_media(session, request.id)
+        photo_groups = build_photo_groups_from(request, items, attachments)
         if photo_groups:
             await callback.bot.send_message(target_executor.tg_id, "Заявка")
             for title, photos in photo_groups:
@@ -148,7 +149,7 @@ async def assign_executor(callback: CallbackQuery) -> None:
                         )
                     elif att.file_id:
                         await callback.bot.send_photo(target_executor.tg_id, att.file_id)
-        for att in request.attachments:
+        for att in attachments:
             if att.file_type != "document":
                 continue
             if att.file_id:
@@ -387,8 +388,7 @@ async def save_delivery_date(message: Message, state: FSMContext) -> None:
             return
         request.expected_delivery_at = delivery_date
         await session.commit()
-        if request.executor:
-            await message.answer("Срок поставки сохранен.")
+        await message.answer("Срок поставки сохранен.")
     await state.clear()
 
 
@@ -414,17 +414,18 @@ async def received_tmc(callback: CallbackQuery) -> None:
                 selectinload(Request.department),
                 selectinload(Request.cfo),
                 selectinload(Request.status),
-                selectinload(Request.items),
-                selectinload(Request.attachments),
                 selectinload(Request.executor),
             ],
         )
         await upsert_request_excel(session, request, settings.files_dir)
         await session.commit()
-        if request.executor:
+        executor = None
+        if request.executor_id:
+            executor = await session.get(User, request.executor_id)
+        if executor:
             await send_to_user(
                 callback.bot,
-                request.executor,
+                executor,
                 f"ТМЦ по заявке №{request.id} было получено",
             )
     await callback.answer("Принято")

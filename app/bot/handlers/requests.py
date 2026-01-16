@@ -31,7 +31,7 @@ from app.db.models import (
 from app.db.session import SessionLocal
 from app.services.constants import APPROVAL_STATUS_PENDING, REQUEST_STATUS_PENDING
 from app.config import settings
-from app.services.attachments import build_photo_groups
+from app.services.attachments import build_photo_groups_from, fetch_request_media
 from app.services.excel import build_request_xlsx
 from app.services.files import save_telegram_file, save_bytes_file
 from app.services.formatters import format_request_summary
@@ -99,23 +99,17 @@ async def _get_status_id(session, model, code: str) -> int:
     return await session.scalar(select(model.id).where(model.code == code))
 
 
-def _get_loaded_attachments(request: Request):
-    from sqlalchemy import inspect
-
-    state = inspect(request)
-    if "attachments" in state.unloaded:
-        return []
-    return request.attachments
-
-
-async def _send_request_with_attachments(bot, request: Request, user: User) -> None:
+async def _send_request_with_attachments(
+    bot,
+    request: Request,
+    user: User,
+    items: list[RequestItem],
+    attachments: list[Attachment],
+) -> None:
     await send_to_user(bot, user, format_request_summary(request))
     if not user.tg_id:
         return
-    attachments = _get_loaded_attachments(request)
-    if attachments:
-        request.attachments = attachments
-    photo_groups = build_photo_groups(request)
+    photo_groups = build_photo_groups_from(request, items, attachments)
     if photo_groups:
         await bot.send_message(user.tg_id, "Заявка")
         for title, photos in photo_groups:
@@ -137,13 +131,17 @@ async def _send_request_with_attachments(bot, request: Request, user: User) -> N
             )
 
 
-async def _send_request_with_attachments_to_chat(bot, request: Request, chat_id: int) -> None:
+async def _send_request_with_attachments_to_chat(
+    bot,
+    request: Request,
+    chat_id: int,
+    items: list[RequestItem],
+    attachments: list[Attachment],
+) -> None:
     await bot.send_message(chat_id, format_request_summary(request))
-    attachments = _get_loaded_attachments(request)
-    if attachments:
-        request.attachments = attachments
-    photo_groups = build_photo_groups(request)
+    photo_groups = build_photo_groups_from(request, items, attachments)
     if photo_groups:
+        await bot.send_message(chat_id, "Заявка")
         for title, photos in photo_groups:
             await bot.send_message(chat_id, title)
             for att in photos:
@@ -163,9 +161,18 @@ async def _send_request_with_attachments_to_chat(bot, request: Request, chat_id:
             )
 
 
-async def _send_approval_to_chat(bot, request: Request, approval_id: int, chat_id: int) -> None:
+async def _send_approval_to_chat(
+    bot,
+    request: Request,
+    approval_id: int,
+    chat_id: int,
+    items: list[RequestItem],
+    attachments: list[Attachment],
+) -> None:
     try:
-        await _send_request_with_attachments_to_chat(bot, request, chat_id)
+        await _send_request_with_attachments_to_chat(
+            bot, request, chat_id, items, attachments
+        )
         await bot.send_message(
             chat_id,
             "Примите решение по заявке:",
@@ -614,7 +621,8 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
         )
         request = refreshed.scalar_one()
 
-        excel_content = build_request_xlsx(request, request.items, request.attachments)
+        items, attachments = await fetch_request_media(session, request.id)
+        excel_content = build_request_xlsx(request, items, attachments)
         excel_name = f"request_{request.id}.xlsx"
         excel_path = save_bytes_file(excel_content, settings.files_dir, excel_name)
         session.add(
@@ -658,17 +666,20 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
         next_pending = await _get_next_pending_approval(session, request.id)
         if next_pending:
             approval, approver = next_pending
+            items, attachments = await fetch_request_media(session, request.id)
             override_tg_id = settings.approval_override_tg_id
             if override_tg_id:
                 await _send_approval_to_chat(
-                    callback.bot, request, approval.id, override_tg_id
+                    callback.bot, request, approval.id, override_tg_id, items, attachments
                 )
             else:
                 target_user = (
                     override_user if override_user and override_user.tg_id else approver
                 )
                 if target_user.tg_id:
-                    await _send_request_with_attachments(callback.bot, request, target_user)
+                    await _send_request_with_attachments(
+                        callback.bot, request, target_user, items, attachments
+                    )
                     await send_to_user(
                         callback.bot,
                         target_user,

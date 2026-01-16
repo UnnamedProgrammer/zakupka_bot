@@ -26,7 +26,7 @@ from app.services.constants import (
     REQUEST_STATUS_APPROVED,
     REQUEST_STATUS_REJECTED,
 )
-from app.services.attachments import build_photo_groups
+from app.services.attachments import build_photo_groups_from, fetch_request_media
 from app.services.excel import upsert_request_excel
 from app.services.formatters import format_request_summary
 from app.services.notifications import send_to_user
@@ -51,25 +51,6 @@ async def _get_next_pending_approval(session, request_id: int):
     return rows.first()
 
 
-async def _hydrate_request_media(session, request: Request) -> None:
-    items = (
-        await session.scalars(
-            select(RequestItem)
-            .where(RequestItem.request_id == request.id)
-            .order_by(RequestItem.id)
-        )
-    ).all()
-    attachments = (
-        await session.scalars(
-            select(Attachment)
-            .where(Attachment.request_id == request.id)
-            .order_by(Attachment.id)
-        )
-    ).all()
-    request.items = items
-    request.attachments = attachments
-
-
 async def _load_request_full(session, request_id: int) -> Request | None:
     result = await session.execute(
         select(Request)
@@ -87,9 +68,15 @@ async def _load_request_full(session, request_id: int) -> Request | None:
     return result.scalar_one_or_none()
 
 
-async def _send_request_with_attachments_to_chat(bot, request: Request, chat_id: int) -> None:
+async def _send_request_with_attachments_to_chat(
+    bot,
+    request: Request,
+    chat_id: int,
+    items: list[RequestItem],
+    attachments: list[Attachment],
+) -> None:
     await bot.send_message(chat_id, format_request_summary(request))
-    photo_groups = build_photo_groups(request)
+    photo_groups = build_photo_groups_from(request, items, attachments)
     if photo_groups:
         await bot.send_message(chat_id, "Заявка")
         for title, photos in photo_groups:
@@ -99,7 +86,7 @@ async def _send_request_with_attachments_to_chat(bot, request: Request, chat_id:
                     await bot.send_photo(chat_id, FSInputFile(att.file_path))
                 elif att.file_id:
                     await bot.send_photo(chat_id, att.file_id)
-    for att in request.attachments:
+    for att in attachments:
         if att.file_type != "document":
             continue
         if att.file_id:
@@ -160,16 +147,16 @@ async def approval_accept(callback: CallbackQuery) -> None:
         if not request:
             await callback.answer("Заявка не найдена")
             return
-        await _hydrate_request_media(session, request)
         await callback.message.answer(f"Заявка №{request.id} принята.")
 
         next_pending = await _get_next_pending_approval(session, request.id)
         if next_pending:
             next_approval, next_approver = next_pending
             override_tg_id = settings.approval_override_tg_id
+            items, attachments = await fetch_request_media(session, request.id)
             if override_tg_id:
                 await _send_request_with_attachments_to_chat(
-                    callback.bot, request, override_tg_id
+                    callback.bot, request, override_tg_id, items, attachments
                 )
                 await callback.bot.send_message(
                     override_tg_id,
@@ -178,7 +165,7 @@ async def approval_accept(callback: CallbackQuery) -> None:
                 )
             elif next_approver.tg_id:
                 await send_to_user(callback.bot, next_approver, format_request_summary(request))
-                photo_groups = build_photo_groups(request)
+                photo_groups = build_photo_groups_from(request, items, attachments)
                 if photo_groups:
                     await callback.bot.send_message(next_approver.tg_id, "Заявка")
                     for title, photos in photo_groups:
@@ -190,7 +177,7 @@ async def approval_accept(callback: CallbackQuery) -> None:
                                 )
                             elif att.file_id:
                                 await callback.bot.send_photo(next_approver.tg_id, att.file_id)
-                for att in request.attachments:
+                for att in attachments:
                     if att.file_type != "document":
                         continue
                     if att.file_id:
@@ -219,7 +206,7 @@ async def approval_accept(callback: CallbackQuery) -> None:
         if not request:
             await callback.answer("Заявка не найдена")
             return
-        await _hydrate_request_media(session, request)
+        items, attachments = await fetch_request_media(session, request.id)
         await upsert_request_excel(session, request, settings.files_dir)
         await session.commit()
 
@@ -240,7 +227,9 @@ async def approval_accept(callback: CallbackQuery) -> None:
 
         override_tg_id = settings.approval_override_tg_id
         if override_tg_id:
-            await _send_request_with_attachments_to_chat(callback.bot, request, override_tg_id)
+            await _send_request_with_attachments_to_chat(
+                callback.bot, request, override_tg_id, items, attachments
+            )
             await callback.bot.send_message(
                 override_tg_id,
                 "Выберите исполнителя для заявки:",

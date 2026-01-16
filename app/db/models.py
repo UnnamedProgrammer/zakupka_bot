@@ -15,7 +15,7 @@ class Role(Base):
     code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
 
-    users: Mapped[list["User"]] = relationship(back_populates="role")
+    users: Mapped[list["User"]] = relationship(back_populates="role", lazy="raise")
 
 
 class Department(Base):
@@ -24,8 +24,8 @@ class Department(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
 
-    users: Mapped[list["User"]] = relationship(back_populates="department")
-    requests: Mapped[list["Request"]] = relationship(back_populates="department")
+    users: Mapped[list["User"]] = relationship(back_populates="department", lazy="raise")
+    requests: Mapped[list["Request"]] = relationship(back_populates="department", lazy="raise")
 
 
 class Cfo(Base):
@@ -34,7 +34,7 @@ class Cfo(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
 
-    requests: Mapped[list["Request"]] = relationship(back_populates="cfo")
+    requests: Mapped[list["Request"]] = relationship(back_populates="cfo", lazy="raise")
 
 
 class RequestStatus(Base):
@@ -44,7 +44,7 @@ class RequestStatus(Base):
     code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
 
-    requests: Mapped[list["Request"]] = relationship(back_populates="status")
+    requests: Mapped[list["Request"]] = relationship(back_populates="status", lazy="raise")
 
 
 class ApprovalStatus(Base):
@@ -54,7 +54,7 @@ class ApprovalStatus(Base):
     code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
 
-    approvals: Mapped[list["Approval"]] = relationship(back_populates="status")
+    approvals: Mapped[list["Approval"]] = relationship(back_populates="status", lazy="raise")
 
 
 class User(Base):
@@ -73,17 +73,21 @@ class User(Base):
         DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow
     )
 
-    role: Mapped["Role"] = relationship(back_populates="users")
-    department: Mapped["Department"] = relationship(back_populates="users")
+    role: Mapped["Role"] = relationship(back_populates="users", lazy="raise")
+    department: Mapped["Department"] = relationship(back_populates="users", lazy="raise")
     created_requests: Mapped[list["Request"]] = relationship(
-        back_populates="initiator", foreign_keys="Request.initiator_id"
+        back_populates="initiator",
+        foreign_keys="Request.initiator_id",
+        lazy="raise",
     )
     assigned_requests: Mapped[list["Request"]] = relationship(
-        back_populates="executor", foreign_keys="Request.executor_id"
+        back_populates="executor",
+        foreign_keys="Request.executor_id",
+        lazy="raise",
     )
-    approvals: Mapped[list["Approval"]] = relationship(back_populates="approver")
-    comments: Mapped[list["Comment"]] = relationship(back_populates="author")
-    attachments: Mapped[list["Attachment"]] = relationship(back_populates="uploader")
+    approvals: Mapped[list["Approval"]] = relationship(back_populates="approver", lazy="raise")
+    comments: Mapped[list["Comment"]] = relationship(back_populates="author", lazy="raise")
+    attachments: Mapped[list["Attachment"]] = relationship(back_populates="uploader", lazy="raise")
 
 
 class Request(Base):
@@ -119,22 +123,26 @@ class Request(Base):
     approved_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
     done_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
 
-    status: Mapped["RequestStatus"] = relationship(back_populates="requests")
+    status: Mapped["RequestStatus"] = relationship(back_populates="requests", lazy="raise")
     initiator: Mapped["User"] = relationship(
-        back_populates="created_requests", foreign_keys=[initiator_id]
+        back_populates="created_requests",
+        foreign_keys=[initiator_id],
+        lazy="raise",
     )
     executor: Mapped["User"] = relationship(
-        back_populates="assigned_requests", foreign_keys=[executor_id]
+        back_populates="assigned_requests",
+        foreign_keys=[executor_id],
+        lazy="raise",
     )
-    department: Mapped["Department"] = relationship(back_populates="requests")
-    cfo: Mapped["Cfo"] = relationship(back_populates="requests")
-    approvals: Mapped[list["Approval"]] = relationship(back_populates="request")
-    comments: Mapped[list["Comment"]] = relationship(back_populates="request")
+    department: Mapped["Department"] = relationship(back_populates="requests", lazy="raise")
+    cfo: Mapped["Cfo"] = relationship(back_populates="requests", lazy="raise")
+    approvals: Mapped[list["Approval"]] = relationship(back_populates="request", lazy="raise")
+    comments: Mapped[list["Comment"]] = relationship(back_populates="request", lazy="raise")
     attachments: Mapped[list["Attachment"]] = relationship(
-        back_populates="request", order_by="Attachment.id"
+        back_populates="request", order_by="Attachment.id", lazy="raise"
     )
     items: Mapped[list["RequestItem"]] = relationship(
-        back_populates="request", order_by="RequestItem.id"
+        back_populates="request", order_by="RequestItem.id", lazy="raise"
     )
 
 
@@ -152,8 +160,8 @@ class RequestItem(Base):
     note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
-    request: Mapped["Request"] = relationship(back_populates="items")
-    attachments: Mapped[list["Attachment"]] = relationship(back_populates="item")
+    request: Mapped["Request"] = relationship(back_populates="items", lazy="raise")
+    attachments: Mapped[list["Attachment"]] = relationship(back_populates="item", lazy="raise")
 
 
 class Approval(Base):
@@ -167,9 +175,9 @@ class Approval(Base):
     decided_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
-    request: Mapped["Request"] = relationship(back_populates="approvals")
-    approver: Mapped["User"] = relationship(back_populates="approvals")
-    status: Mapped["ApprovalStatus"] = relationship(back_populates="approvals")
+    request: Mapped["Request"] = relationship(back_populates="approvals", lazy="raise")
+    approver: Mapped["User"] = relationship(back_populates="approvals", lazy="raise")
+    status: Mapped["ApprovalStatus"] = relationship(back_populates="approvals", lazy="raise")
 
 
 class Comment(Base):
@@ -182,8 +190,8 @@ class Comment(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     is_system: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    request: Mapped["Request"] = relationship(back_populates="comments")
-    author: Mapped["User"] = relationship(back_populates="comments")
+    request: Mapped["Request"] = relationship(back_populates="comments", lazy="raise")
+    author: Mapped["User"] = relationship(back_populates="comments", lazy="raise")
 
 
 class Attachment(Base):
@@ -200,6 +208,6 @@ class Attachment(Base):
     file_type: Mapped[str] = mapped_column(String(50), nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
-    request: Mapped["Request"] = relationship(back_populates="attachments")
-    uploader: Mapped["User"] = relationship(back_populates="attachments")
-    item: Mapped["RequestItem"] = relationship(back_populates="attachments")
+    request: Mapped["Request"] = relationship(back_populates="attachments", lazy="raise")
+    uploader: Mapped["User"] = relationship(back_populates="attachments", lazy="raise")
+    item: Mapped["RequestItem"] = relationship(back_populates="attachments", lazy="raise")

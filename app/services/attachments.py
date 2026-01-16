@@ -1,4 +1,6 @@
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select
+
+from app.db.models import Attachment, RequestItem
 
 from app.db.models import Attachment, Request
 
@@ -48,3 +50,52 @@ def build_photo_groups(request: Request) -> list[tuple[str, list[Attachment]]]:
             continue
         groups.append((title, photos[:3]))
     return groups
+
+
+def build_photo_groups_from(
+    request: Request,
+    items: list[RequestItem],
+    attachments: list[Attachment],
+) -> list[tuple[str, list[Attachment]]]:
+    titles: list[tuple[int | None, str]] = []
+    if items:
+        for idx, item in enumerate(items, start=1):
+            name = item.name or "-"
+            titles.append((item.id, f"Товар {idx} {name}:"))
+    else:
+        name = request.item_name or "-"
+        titles.append((None, f"Товар 1 {name}:"))
+
+    first_item_id = items[0].id if items else None
+    photos_by_item: dict[int | None, list[Attachment]] = {}
+    for att in attachments:
+        if att.file_type != "photo":
+            continue
+        item_id = att.item_id if att.item_id is not None else first_item_id
+        photos_by_item.setdefault(item_id, []).append(att)
+
+    groups: list[tuple[str, list[Attachment]]] = []
+    for item_id, title in titles:
+        photos = photos_by_item.get(item_id) or []
+        if not photos:
+            continue
+        groups.append((title, photos[:3]))
+    return groups
+
+
+async def fetch_request_media(session, request_id: int) -> tuple[list[RequestItem], list[Attachment]]:
+    items = (
+        await session.scalars(
+            select(RequestItem)
+            .where(RequestItem.request_id == request_id)
+            .order_by(RequestItem.id)
+        )
+    ).all()
+    attachments = (
+        await session.scalars(
+            select(Attachment)
+            .where(Attachment.request_id == request_id)
+            .order_by(Attachment.id)
+        )
+    ).all()
+    return items, attachments
