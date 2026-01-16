@@ -6,7 +6,17 @@ from sqlalchemy.orm import selectinload
 
 from app.bot.keyboards import approval_action_keyboard, executor_assign_keyboard
 from app.bot.states import ApprovalComment, LeaderComment
-from app.db.models import Approval, ApprovalStatus, Comment, Request, RequestStatus, Role, User
+from app.db.models import (
+    Approval,
+    ApprovalStatus,
+    Attachment,
+    Comment,
+    Request,
+    RequestItem,
+    RequestStatus,
+    Role,
+    User,
+)
 from app.db.session import SessionLocal
 from app.config import settings
 from app.services.constants import (
@@ -16,6 +26,8 @@ from app.services.constants import (
     REQUEST_STATUS_APPROVED,
     REQUEST_STATUS_REJECTED,
 )
+from app.services.attachments import build_photo_groups
+from app.services.excel import upsert_request_excel
 from app.services.formatters import format_request_summary
 from app.services.notifications import send_to_user
 from app.services.users import ensure_username_format
@@ -39,22 +51,64 @@ async def _get_next_pending_approval(session, request_id: int):
     return rows.first()
 
 
+async def _hydrate_request_media(session, request: Request) -> None:
+    items = (
+        await session.scalars(
+            select(RequestItem)
+            .where(RequestItem.request_id == request.id)
+            .order_by(RequestItem.id)
+        )
+    ).all()
+    attachments = (
+        await session.scalars(
+            select(Attachment)
+            .where(Attachment.request_id == request.id)
+            .order_by(Attachment.id)
+        )
+    ).all()
+    request.items = items
+    request.attachments = attachments
+
+
+async def _load_request_full(session, request_id: int) -> Request | None:
+    result = await session.execute(
+        select(Request)
+        .where(Request.id == request_id)
+        .options(
+            selectinload(Request.initiator),
+            selectinload(Request.department),
+            selectinload(Request.cfo),
+            selectinload(Request.status),
+            selectinload(Request.attachments),
+            selectinload(Request.items),
+        )
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
 async def _send_request_with_attachments_to_chat(bot, request: Request, chat_id: int) -> None:
     await bot.send_message(chat_id, format_request_summary(request))
+    photo_groups = build_photo_groups(request)
+    if photo_groups:
+        await bot.send_message(chat_id, "Заявка")
+        for title, photos in photo_groups:
+            await bot.send_message(chat_id, title)
+            for att in photos:
+                if att.file_path:
+                    await bot.send_photo(chat_id, FSInputFile(att.file_path))
+                elif att.file_id:
+                    await bot.send_photo(chat_id, att.file_id)
     for att in request.attachments:
-        if att.file_type == "photo":
-            if att.file_id:
-                await bot.send_photo(chat_id, att.file_id)
-            elif att.file_path:
-                await bot.send_photo(chat_id, FSInputFile(att.file_path))
-        elif att.file_type == "document":
-            if att.file_id:
-                await bot.send_document(chat_id, att.file_id)
-            elif att.file_path:
-                await bot.send_document(
-                    chat_id,
-                    FSInputFile(att.file_path, filename=att.file_name or None),
-                )
+        if att.file_type != "document":
+            continue
+        if att.file_id:
+            await bot.send_document(chat_id, att.file_id)
+        elif att.file_path:
+            await bot.send_document(
+                chat_id,
+                FSInputFile(att.file_path, filename=att.file_name or None),
+            )
 
 
 async def _is_override_user(tg_user) -> bool:
@@ -102,18 +156,11 @@ async def approval_accept(callback: CallbackQuery) -> None:
         approval.decided_at = to_naive_utc(callback.message.date)
         await session.commit()
 
-        request = await session.get(
-            Request,
-            approval.request_id,
-            options=[
-                selectinload(Request.initiator),
-                selectinload(Request.department),
-                selectinload(Request.cfo),
-                selectinload(Request.status),
-                selectinload(Request.attachments),
-                selectinload(Request.items),
-            ],
-        )
+        request = await _load_request_full(session, approval.request_id)
+        if not request:
+            await callback.answer("Заявка не найдена")
+            return
+        await _hydrate_request_media(session, request)
         await callback.message.answer(f"Заявка №{request.id} принята.")
 
         next_pending = await _get_next_pending_approval(session, request.id)
@@ -131,22 +178,28 @@ async def approval_accept(callback: CallbackQuery) -> None:
                 )
             elif next_approver.tg_id:
                 await send_to_user(callback.bot, next_approver, format_request_summary(request))
+                photo_groups = build_photo_groups(request)
+                if photo_groups:
+                    await callback.bot.send_message(next_approver.tg_id, "Заявка")
+                    for title, photos in photo_groups:
+                        await callback.bot.send_message(next_approver.tg_id, title)
+                        for att in photos:
+                            if att.file_path:
+                                await callback.bot.send_photo(
+                                    next_approver.tg_id, FSInputFile(att.file_path)
+                                )
+                            elif att.file_id:
+                                await callback.bot.send_photo(next_approver.tg_id, att.file_id)
                 for att in request.attachments:
-                    if att.file_type == "photo":
-                        if att.file_id:
-                            await callback.bot.send_photo(next_approver.tg_id, att.file_id)
-                        elif att.file_path:
-                            await callback.bot.send_photo(
-                                next_approver.tg_id, FSInputFile(att.file_path)
-                            )
-                    elif att.file_type == "document":
-                        if att.file_id:
-                            await callback.bot.send_document(next_approver.tg_id, att.file_id)
-                        elif att.file_path:
-                            await callback.bot.send_document(
-                                next_approver.tg_id,
-                                FSInputFile(att.file_path, filename=att.file_name or None),
-                            )
+                    if att.file_type != "document":
+                        continue
+                    if att.file_id:
+                        await callback.bot.send_document(next_approver.tg_id, att.file_id)
+                    elif att.file_path:
+                        await callback.bot.send_document(
+                            next_approver.tg_id,
+                            FSInputFile(att.file_path, filename=att.file_name or None),
+                        )
                 await send_to_user(
                     callback.bot,
                     next_approver,
@@ -161,8 +214,14 @@ async def approval_accept(callback: CallbackQuery) -> None:
         status_id = await _get_status_id(session, RequestStatus, REQUEST_STATUS_APPROVED)
         request.status_id = status_id
         request.approved_at = to_naive_utc(callback.message.date)
+        await session.flush()
+        request = await _load_request_full(session, request.id)
+        if not request:
+            await callback.answer("Заявка не найдена")
+            return
+        await _hydrate_request_media(session, request)
+        await upsert_request_excel(session, request, settings.files_dir)
         await session.commit()
-        await session.refresh(request, attribute_names=["status"])
 
         await send_to_user(
             callback.bot,
@@ -284,9 +343,12 @@ async def approval_reject_comment(message: Message, state: FSMContext) -> None:
                 selectinload(Request.cfo),
                 selectinload(Request.status),
                 selectinload(Request.items),
+                selectinload(Request.attachments),
             ],
         )
         request.status_id = status_id
+        await session.flush()
+        await upsert_request_excel(session, request, settings.files_dir)
         await session.commit()
 
         summary = await _format_approval_summary(session, request.id)

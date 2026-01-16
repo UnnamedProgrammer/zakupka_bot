@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from aiogram import F, Router
@@ -30,6 +31,7 @@ from app.db.models import (
 from app.db.session import SessionLocal
 from app.services.constants import APPROVAL_STATUS_PENDING, REQUEST_STATUS_PENDING
 from app.config import settings
+from app.services.attachments import build_photo_groups
 from app.services.excel import build_request_xlsx
 from app.services.files import save_telegram_file, save_bytes_file
 from app.services.formatters import format_request_summary
@@ -38,6 +40,59 @@ from app.services.users import ensure_username_format, get_or_create_user
 
 router = Router()
 logger = logging.getLogger(__name__)
+_album_buffers: dict[tuple[int, str], dict] = {}
+
+
+def _is_image_document(message: Message) -> bool:
+    if not message.document:
+        return False
+    mime_type = message.document.mime_type or ""
+    return mime_type.startswith("image/")
+
+
+async def _queue_album_attachment(message: Message, state: FSMContext, file_info: dict) -> None:
+    if not message.media_group_id:
+        return
+    key = (message.chat.id, message.media_group_id)
+    buffer = _album_buffers.get(key)
+    if not buffer:
+        buffer = {"photos": [], "chat_id": message.chat.id, "bot": message.bot, "task": None}
+        _album_buffers[key] = buffer
+    buffer["photos"].append(file_info)
+    if buffer["task"] is None:
+        buffer["task"] = asyncio.create_task(_flush_album(key, state))
+
+
+async def _flush_album(key: tuple[int, str], state: FSMContext) -> None:
+    await asyncio.sleep(0.8)
+    buffer = _album_buffers.pop(key, None)
+    if not buffer:
+        return
+    data = await state.get_data()
+    current_item = data.get("current_item") or {}
+    attachments = current_item.get("attachments") or []
+    current_photos = sum(1 for att in attachments if att.get("file_type") == "photo")
+    allowed = max(0, 3 - current_photos)
+    if allowed <= 0:
+        await buffer["bot"].send_message(
+            buffer["chat_id"], "Можно добавить не более 3 фото для товара."
+        )
+        return
+    photos = buffer["photos"]
+    to_add = photos[:allowed]
+    attachments.extend(to_add)
+    current_item["attachments"] = attachments
+    await state.update_data(current_item=current_item)
+    if len(photos) > allowed:
+        await buffer["bot"].send_message(
+            buffer["chat_id"],
+            f"Добавлено {allowed} фото. Ограничение на количество фото макс. 3",
+        )
+    else:
+        await buffer["bot"].send_message(
+            buffer["chat_id"],
+            f"Добавлено фото: {len(photos)}. Можно отправить еще или нажмите «Готово».",
+        )
 
 
 async def _get_status_id(session, model, code: str) -> int:
@@ -55,42 +110,57 @@ def _get_loaded_attachments(request: Request):
 
 async def _send_request_with_attachments(bot, request: Request, user: User) -> None:
     await send_to_user(bot, user, format_request_summary(request))
+    if not user.tg_id:
+        return
     attachments = _get_loaded_attachments(request)
+    if attachments:
+        request.attachments = attachments
+    photo_groups = build_photo_groups(request)
+    if photo_groups:
+        await bot.send_message(user.tg_id, "Заявка")
+        for title, photos in photo_groups:
+            await bot.send_message(user.tg_id, title)
+            for att in photos:
+                if att.file_path:
+                    await bot.send_photo(user.tg_id, FSInputFile(att.file_path))
+                elif att.file_id:
+                    await bot.send_photo(user.tg_id, att.file_id)
     for att in attachments:
-        if not user.tg_id:
+        if att.file_type != "document":
             continue
-        if att.file_type == "photo":
-            if att.file_id:
-                await bot.send_photo(user.tg_id, att.file_id)
-            elif att.file_path:
-                await bot.send_photo(user.tg_id, FSInputFile(att.file_path))
-        elif att.file_type == "document":
-            if att.file_id:
-                await bot.send_document(user.tg_id, att.file_id)
-            elif att.file_path:
-                await bot.send_document(
-                    user.tg_id,
-                    FSInputFile(att.file_path, filename=att.file_name or None),
-                )
+        if att.file_id:
+            await bot.send_document(user.tg_id, att.file_id)
+        elif att.file_path:
+            await bot.send_document(
+                user.tg_id,
+                FSInputFile(att.file_path, filename=att.file_name or None),
+            )
 
 
 async def _send_request_with_attachments_to_chat(bot, request: Request, chat_id: int) -> None:
     await bot.send_message(chat_id, format_request_summary(request))
     attachments = _get_loaded_attachments(request)
+    if attachments:
+        request.attachments = attachments
+    photo_groups = build_photo_groups(request)
+    if photo_groups:
+        for title, photos in photo_groups:
+            await bot.send_message(chat_id, title)
+            for att in photos:
+                if att.file_path:
+                    await bot.send_photo(chat_id, FSInputFile(att.file_path))
+                elif att.file_id:
+                    await bot.send_photo(chat_id, att.file_id)
     for att in attachments:
-        if att.file_type == "photo":
-            if att.file_id:
-                await bot.send_photo(chat_id, att.file_id)
-            elif att.file_path:
-                await bot.send_photo(chat_id, FSInputFile(att.file_path))
-        elif att.file_type == "document":
-            if att.file_id:
-                await bot.send_document(chat_id, att.file_id)
-            elif att.file_path:
-                await bot.send_document(
-                    chat_id,
-                    FSInputFile(att.file_path, filename=att.file_name or None),
-                )
+        if att.file_type != "document":
+            continue
+        if att.file_id:
+            await bot.send_document(chat_id, att.file_id)
+        elif att.file_path:
+            await bot.send_document(
+                chat_id,
+                FSInputFile(att.file_path, filename=att.file_name or None),
+            )
 
 
 async def _send_approval_to_chat(bot, request: Request, approval_id: int, chat_id: int) -> None:
@@ -197,7 +267,9 @@ async def create_request_description_method(callback: CallbackQuery, state: FSMC
 async def create_request_item_name(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     items = data.get("items") or []
-    await state.update_data(items=items, current_item={"name": message.text.strip()})
+    await state.update_data(
+        items=items, current_item={"name": message.text.strip(), "attachments": []}
+    )
     await state.set_state(RequestCreate.item_specs)
     await message.answer("Технические характеристики")
 
@@ -237,10 +309,8 @@ async def create_request_item_unit(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     current = data.get("current_item") or {}
     current["unit"] = message.text.strip()
-    attachments = data.get("attachments")
-    if attachments is None:
-        attachments = []
-    await state.update_data(current_item=current, attachments=attachments)
+    current.setdefault("attachments", [])
+    await state.update_data(current_item=current)
     await state.set_state(RequestCreate.item_link_or_photo)
     await message.answer(
         "Отправьте фото, файл или ссылку на товар (если нужно) и нажмите «Готово».",
@@ -251,8 +321,26 @@ async def create_request_item_unit(message: Message, state: FSMContext) -> None:
 @router.message(RequestCreate.item_link_or_photo)
 async def create_request_item_link_or_photo(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    attachments = data.get("attachments", [])
+    current_item = data.get("current_item") or {}
+    attachments = current_item.get("attachments") or []
     if message.photo:
+        if message.media_group_id:
+            photo = message.photo[-1]
+            await _queue_album_attachment(
+                message,
+                state,
+                {
+                    "file_id": photo.file_id,
+                    "file_unique_id": photo.file_unique_id,
+                    "file_type": "photo",
+                    "file_name": None,
+                },
+            )
+            return
+        photo_count = sum(1 for att in attachments if att.get("file_type") == "photo")
+        if photo_count >= 3:
+            await message.answer("Можно добавить не более 3 фото для товара.")
+            return
         photo = message.photo[-1]
         attachments.append(
             {
@@ -262,10 +350,42 @@ async def create_request_item_link_or_photo(message: Message, state: FSMContext)
                 "file_name": None,
             }
         )
-        await state.update_data(attachments=attachments)
+        current_item["attachments"] = attachments
+        await state.update_data(current_item=current_item)
         await message.answer("Фото добавлено. Можно отправить еще или нажмите «Готово».")
         return
     if message.document:
+        if _is_image_document(message):
+            if message.media_group_id:
+                doc = message.document
+                await _queue_album_attachment(
+                    message,
+                    state,
+                    {
+                        "file_id": doc.file_id,
+                        "file_unique_id": doc.file_unique_id,
+                        "file_type": "photo",
+                        "file_name": doc.file_name,
+                    },
+                )
+                return
+            photo_count = sum(1 for att in attachments if att.get("file_type") == "photo")
+            if photo_count >= 3:
+                await message.answer("Можно добавить не более 3 фото для товара.")
+                return
+            doc = message.document
+            attachments.append(
+                {
+                    "file_id": doc.file_id,
+                    "file_unique_id": doc.file_unique_id,
+                    "file_type": "photo",
+                    "file_name": doc.file_name,
+                }
+            )
+            current_item["attachments"] = attachments
+            await state.update_data(current_item=current_item)
+            await message.answer("Фото добавлено. Можно отправить еще или нажмите «Готово».")
+            return
         doc = message.document
         attachments.append(
             {
@@ -275,11 +395,11 @@ async def create_request_item_link_or_photo(message: Message, state: FSMContext)
                 "file_name": doc.file_name,
             }
         )
-        await state.update_data(attachments=attachments)
+        current_item["attachments"] = attachments
+        await state.update_data(current_item=current_item)
         await message.answer("Файл добавлен. Можно отправить еще или нажмите «Готово».")
         return
     if message.text:
-        current_item = data.get("current_item") or {}
         current = current_item.get("link", "")
         if current:
             current = f"{current}\n{message.text.strip()}"
@@ -289,7 +409,7 @@ async def create_request_item_link_or_photo(message: Message, state: FSMContext)
         await state.update_data(current_item=current_item)
         await message.answer("Ссылка сохранена. Можно отправить еще или нажмите «Готово».")
         return
-    await message.answer("Отправьте фото или ссылку, либо нажмите «Готово».")
+    await message.answer("Отправьте фото, файл или ссылку, либо нажмите «Готово».")
 
 
 @router.callback_query(RequestCreate.item_link_or_photo, F.data == "attachments:done")
@@ -382,18 +502,42 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
         await session.flush()
 
         for item in items:
-            session.add(
-                RequestItem(
-                    request_id=request.id,
-                    name=item.get("name"),
-                    specs=item.get("specs"),
-                    brand=item.get("brand"),
-                    qty=item.get("qty"),
-                    unit=item.get("unit"),
-                    link=item.get("link"),
-                    note=item.get("note"),
-                )
+            item_row = RequestItem(
+                request_id=request.id,
+                name=item.get("name"),
+                specs=item.get("specs"),
+                brand=item.get("brand"),
+                qty=item.get("qty"),
+                unit=item.get("unit"),
+                link=item.get("link"),
+                note=item.get("note"),
             )
+            session.add(item_row)
+            await session.flush()
+            photo_saved = 0
+            for item_att in item.get("attachments") or []:
+                if item_att.get("file_type") == "photo":
+                    if photo_saved >= 3:
+                        continue
+                    photo_saved += 1
+                file_path = await save_telegram_file(
+                    callback.bot,
+                    item_att["file_id"],
+                    dest_dir=settings.files_dir,
+                    filename_hint=item_att.get("file_name"),
+                )
+                session.add(
+                    Attachment(
+                        request_id=request.id,
+                        uploader_id=initiator.id,
+                        item_id=item_row.id,
+                        file_id=item_att["file_id"],
+                        file_unique_id=item_att["file_unique_id"],
+                        file_name=item_att.get("file_name"),
+                        file_path=file_path,
+                        file_type=item_att["file_type"],
+                    )
+                )
 
         approval_status_id = await _get_status_id(
             session, ApprovalStatus, APPROVAL_STATUS_PENDING
@@ -452,26 +596,6 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
             )
             session.add(approval)
             approvals.append(approval)
-
-        attachments = data.get("attachments", [])
-        for item in attachments:
-            file_path = await save_telegram_file(
-                callback.bot,
-                item["file_id"],
-                dest_dir=settings.files_dir,
-                filename_hint=item.get("file_name"),
-            )
-            session.add(
-                Attachment(
-                    request_id=request.id,
-                    uploader_id=initiator.id,
-                    file_id=item["file_id"],
-                    file_unique_id=item["file_unique_id"],
-                    file_name=item.get("file_name"),
-                    file_path=file_path,
-                    file_type=item["file_type"],
-                )
-            )
 
         await session.commit()
 

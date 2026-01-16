@@ -2,10 +2,12 @@ from io import BytesIO
 from typing import Iterable
 
 from openpyxl import Workbook
-from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.db.models import Attachment, Request, RequestItem
+from app.services.files import save_bytes_file
 
 
 def build_daily_requests_xlsx(requests: Iterable[Request]) -> bytes:
@@ -76,17 +78,6 @@ def build_employee_stats_xlsx(requests: Iterable[Request]) -> bytes:
     return bio.getvalue()
 
 
-def _load_photo_paths(attachments: Iterable[Attachment]) -> list[str]:
-    paths = []
-    for att in attachments:
-        if att.file_type != "photo":
-            continue
-        if not att.file_path:
-            continue
-        paths.append(att.file_path)
-    return paths
-
-
 def build_request_xlsx(
     request: Request, items: Iterable[RequestItem], attachments: Iterable[Attachment]
 ) -> bytes:
@@ -137,11 +128,10 @@ def build_request_xlsx(
             "Ед.",
             "Ссылка",
             "Примечание",
-            "Фото",
         ]
     )
     header_row = ws.max_row
-    for col in range(1, 10):
+    for col in range(1, 9):
         cell = ws.cell(row=header_row, column=col)
         cell.font = bold
         cell.fill = header_fill
@@ -149,7 +139,6 @@ def build_request_xlsx(
         cell.border = border
 
     item_list = list(items)
-    photo_paths = _load_photo_paths(attachments)
     if not item_list:
         ws.append(
             [
@@ -161,7 +150,6 @@ def build_request_xlsx(
                 request.item_unit or "",
                 request.item_link or "-",
                 request.item_note or "",
-                "-",
             ]
         )
     else:
@@ -176,10 +164,9 @@ def build_request_xlsx(
                     item.unit or "",
                     item.link or "-",
                     item.note or "",
-                    "-",
                 ]
             )
-    for row in ws.iter_rows(min_row=header_row + 1, max_col=9):
+    for row in ws.iter_rows(min_row=header_row + 1, max_col=8):
         for cell in row:
             cell.alignment = wrap
             cell.border = border
@@ -201,22 +188,65 @@ def build_request_xlsx(
     ws.column_dimensions["F"].width = 8
     ws.column_dimensions["G"].width = 26
     ws.column_dimensions["H"].width = 28
-    ws.column_dimensions["I"].width = 18
-
-    if photo_paths:
-        max_photos = min(len(photo_paths), max(1, len(item_list)))
-        for idx in range(max_photos):
-            row_idx = header_row + 1 + idx
-            try:
-                img = XLImage(photo_paths[idx])
-            except Exception:
-                continue
-            ws.cell(row=row_idx, column=9).value = ""
-            img.width = 120
-            img.height = 120
-            ws.row_dimensions[row_idx].height = 90
-            ws.add_image(img, f"I{row_idx}")
-
     bio = BytesIO()
     wb.save(bio)
     return bio.getvalue()
+
+
+async def upsert_request_excel(session, request: Request, files_dir: str) -> None:
+    filename = f"request_{request.id}.xlsx"
+    result = await session.execute(
+        select(Request)
+        .where(Request.id == request.id)
+        .options(
+            selectinload(Request.initiator),
+            selectinload(Request.department),
+            selectinload(Request.cfo),
+            selectinload(Request.status),
+        )
+        .execution_options(populate_existing=True)
+    )
+    req = result.scalar_one_or_none()
+    if not req:
+        return
+    items = (
+        await session.scalars(
+            select(RequestItem)
+            .where(RequestItem.request_id == request.id)
+            .order_by(RequestItem.id)
+        )
+    ).all()
+    attachments = (
+        await session.scalars(
+            select(Attachment)
+            .where(Attachment.request_id == request.id)
+            .order_by(Attachment.id)
+        )
+    ).all()
+    content = build_request_xlsx(req, items, attachments)
+    path = save_bytes_file(content, files_dir, filename)
+    attachment = await session.scalar(
+        select(Attachment).where(
+            Attachment.request_id == request.id,
+            Attachment.file_name == filename,
+            Attachment.item_id.is_(None),
+        )
+    )
+    if attachment:
+        attachment.file_path = path
+        attachment.file_type = "document"
+        attachment.file_id = None
+        attachment.file_unique_id = None
+    else:
+        session.add(
+            Attachment(
+                request_id=request.id,
+                uploader_id=request.initiator_id,
+                item_id=None,
+                file_id=None,
+                file_unique_id=None,
+                file_name=filename,
+                file_path=path,
+                file_type="document",
+            )
+        )

@@ -130,7 +130,9 @@ class Request(Base):
     cfo: Mapped["Cfo"] = relationship(back_populates="requests")
     approvals: Mapped[list["Approval"]] = relationship(back_populates="request")
     comments: Mapped[list["Comment"]] = relationship(back_populates="request")
-    attachments: Mapped[list["Attachment"]] = relationship(back_populates="request")
+    attachments: Mapped[list["Attachment"]] = relationship(
+        back_populates="request", order_by="Attachment.id"
+    )
     items: Mapped[list["RequestItem"]] = relationship(
         back_populates="request", order_by="RequestItem.id"
     )
@@ -151,6 +153,7 @@ class RequestItem(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
     request: Mapped["Request"] = relationship(back_populates="items")
+    attachments: Mapped[list["Attachment"]] = relationship(back_populates="item")
 
 
 class Approval(Base):
@@ -189,6 +192,7 @@ class Attachment(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     request_id: Mapped[int] = mapped_column(ForeignKey("requests.id"), nullable=False)
     uploader_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    item_id: Mapped[int | None] = mapped_column(ForeignKey("request_items.id"))
     file_id: Mapped[str | None] = mapped_column(String(200))
     file_unique_id: Mapped[str | None] = mapped_column(String(200))
     file_name: Mapped[str | None] = mapped_column(String(255))
@@ -198,3 +202,4 @@ class Attachment(Base):
 
     request: Mapped["Request"] = relationship(back_populates="attachments")
     uploader: Mapped["User"] = relationship(back_populates="attachments")
+    item: Mapped["RequestItem"] = relationship(back_populates="attachments")

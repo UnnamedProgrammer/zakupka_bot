@@ -17,7 +17,12 @@ from app.services.constants import (
     REQUEST_STATUS_REJECTED,
     REQUEST_STATUS_RECEIVED,
 )
-from app.services.excel import build_daily_requests_xlsx, build_employee_stats_xlsx
+from app.services.attachments import build_photo_groups
+from app.services.excel import (
+    build_daily_requests_xlsx,
+    build_employee_stats_xlsx,
+    upsert_request_excel,
+)
 from app.services.files import save_telegram_file
 from app.services.formatters import format_request_summary
 from app.services.notifications import send_to_user
@@ -131,20 +136,28 @@ async def assign_executor(callback: CallbackQuery) -> None:
             format_request_summary(request),
             reply_markup=_executor_keyboard_for_request(request),
         )
+        photo_groups = build_photo_groups(request)
+        if photo_groups:
+            await callback.bot.send_message(target_executor.tg_id, "Заявка")
+            for title, photos in photo_groups:
+                await callback.bot.send_message(target_executor.tg_id, title)
+                for att in photos:
+                    if att.file_path:
+                        await callback.bot.send_photo(
+                            target_executor.tg_id, FSInputFile(att.file_path)
+                        )
+                    elif att.file_id:
+                        await callback.bot.send_photo(target_executor.tg_id, att.file_id)
         for att in request.attachments:
-            if att.file_type == "photo":
-                if att.file_id:
-                    await callback.bot.send_photo(target_executor.tg_id, att.file_id)
-                elif att.file_path:
-                    await callback.bot.send_photo(target_executor.tg_id, FSInputFile(att.file_path))
-            elif att.file_type == "document":
-                if att.file_id:
-                    await callback.bot.send_document(target_executor.tg_id, att.file_id)
-                elif att.file_path:
-                    await callback.bot.send_document(
-                        target_executor.tg_id,
-                        FSInputFile(att.file_path, filename=att.file_name or None),
-                    )
+            if att.file_type != "document":
+                continue
+            if att.file_id:
+                await callback.bot.send_document(target_executor.tg_id, att.file_id)
+            elif att.file_path:
+                await callback.bot.send_document(
+                    target_executor.tg_id,
+                    FSInputFile(att.file_path, filename=att.file_name or None),
+                )
         await send_to_user(
             callback.bot,
             request.initiator,
@@ -181,8 +194,21 @@ async def update_status(callback: CallbackQuery, state: FSMContext) -> None:
             return
         status_id = await _get_request_status_id(session, status_code)
         request.status_id = status_id
+        await session.flush()
+        request = await session.get(
+            Request,
+            request_id,
+            options=[
+                selectinload(Request.initiator),
+                selectinload(Request.department),
+                selectinload(Request.cfo),
+                selectinload(Request.status),
+                selectinload(Request.items),
+                selectinload(Request.attachments),
+            ],
+        )
+        await upsert_request_excel(session, request, settings.files_dir)
         await session.commit()
-        await session.refresh(request, attribute_names=["status"])
 
         await send_to_user(
             callback.bot,
@@ -216,6 +242,19 @@ async def executor_comment(message: Message, state: FSMContext) -> None:
             if status_code == REQUEST_STATUS_DONE:
                 request.done_at = to_naive_utc(message.date)
             await session.flush()
+            request = await session.get(
+                Request,
+                request_id,
+                options=[
+                    selectinload(Request.initiator),
+                    selectinload(Request.department),
+                    selectinload(Request.cfo),
+                    selectinload(Request.status),
+                    selectinload(Request.items),
+                    selectinload(Request.attachments),
+                ],
+            )
+            await upsert_request_excel(session, request, settings.files_dir)
         session.add(
             Comment(
                 request_id=request.id,
@@ -226,19 +265,27 @@ async def executor_comment(message: Message, state: FSMContext) -> None:
         await session.commit()
 
         if status_code:
-            await session.refresh(request, attribute_names=["status"])
+            updated = await session.get(
+                Request,
+                request.id,
+                options=[selectinload(Request.initiator), selectinload(Request.status)],
+            )
+            status_name = updated.status.name if updated and updated.status else status_code
             await send_to_user(
                 message.bot,
-                request.initiator,
+                updated.initiator if updated else request.initiator,
                 (
-                    f"Изменен статус вашей заявки №{request.id}: {request.status.name}. "
+                    f"Изменен статус вашей заявки №{request.id}: {status_name}. "
                     f"Комментарий: {message.text.strip()}"
                 ),
             )
         else:
+            updated = await session.get(
+                Request, request.id, options=[selectinload(Request.initiator)]
+            )
             await send_to_user(
                 message.bot,
-                request.initiator,
+                updated.initiator if updated else request.initiator,
                 f"Комментарий к заявке №{request.id}: {message.text.strip()}",
             )
         if status_code == REQUEST_STATUS_DONE:
@@ -358,6 +405,21 @@ async def received_tmc(callback: CallbackQuery) -> None:
         status_id = await _get_request_status_id(session, REQUEST_STATUS_RECEIVED)
         request.status_id = status_id
         request.received_at = to_naive_utc(callback.message.date)
+        await session.flush()
+        request = await session.get(
+            Request,
+            request_id,
+            options=[
+                selectinload(Request.initiator),
+                selectinload(Request.department),
+                selectinload(Request.cfo),
+                selectinload(Request.status),
+                selectinload(Request.items),
+                selectinload(Request.attachments),
+                selectinload(Request.executor),
+            ],
+        )
+        await upsert_request_excel(session, request, settings.files_dir)
         await session.commit()
         if request.executor:
             await send_to_user(
