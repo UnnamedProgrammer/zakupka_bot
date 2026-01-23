@@ -16,6 +16,7 @@ def format_request_summary(req: Request) -> str:
     cfo = _get_loaded(req, "cfo")
     status = _get_loaded(req, "status")
     items = _get_loaded(req, "items") or []
+    comments = _get_loaded(req, "comments")
 
     username = initiator.tg_username if initiator else ""
     username_display = f" ({username})" if username else ""
@@ -25,6 +26,9 @@ def format_request_summary(req: Request) -> str:
     status_name = status.name if status else "-"
     created_at = req.created_at.strftime("%d-%m-%Y %H:%M") if req.created_at else "-"
     done_at = req.done_at.strftime("%d-%m-%Y %H:%M") if req.done_at else "-"
+    expected_delivery = (
+        req.expected_delivery_at.strftime("%d-%m-%Y") if req.expected_delivery_at else "-"
+    )
     lines = [
         f"Заявка №{req.id}",
         f"Дата создания: {created_at}",
@@ -33,6 +37,7 @@ def format_request_summary(req: Request) -> str:
         f"Подразделение: {department_name}",
         f"ЦФО: {cfo_name}",
         f"МОЛ: {req.mol_full_name or '-'}",
+        f"Срок поставки: {expected_delivery}",
         f"Статус: {status_name}",
     ]
     if items:
@@ -58,4 +63,9 @@ def format_request_summary(req: Request) -> str:
                 f"Примечание: {req.item_note or '-'}",
             ]
         )
+    if comments:
+        lines.append("Комментарии:")
+        for comment in comments:
+            if comment.text:
+                lines.append(f"- {comment.text}")
     return "\n".join(lines)

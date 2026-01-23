@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, String, Text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, String, Text, Table, Column
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+
+user_roles = Table(
+    "user_roles",
+    Base.metadata,
+    Column("user_id", ForeignKey("users.id"), primary_key=True),
+    Column("role_id", ForeignKey("roles.id"), primary_key=True),
+)
 
 
 class Role(Base):
@@ -15,7 +23,9 @@ class Role(Base):
     code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
 
-    users: Mapped[list["User"]] = relationship(back_populates="role", lazy="raise")
+    users: Mapped[list["User"]] = relationship(
+        secondary=user_roles, back_populates="roles", lazy="raise"
+    )
 
 
 class Department(Base):
@@ -35,6 +45,42 @@ class Cfo(Base):
     name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
 
     requests: Mapped[list["Request"]] = relationship(back_populates="cfo", lazy="raise")
+
+
+class OmtsResponsible(Base):
+    __tablename__ = "omts_responsibles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+
+    items: Mapped[list["RequestItem"]] = relationship(
+        back_populates="omts_responsible",
+        lazy="raise",
+    )
+
+
+class RequestCategory(Base):
+    __tablename__ = "request_categories"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+
+    items: Mapped[list["RequestItem"]] = relationship(
+        back_populates="category",
+        lazy="raise",
+    )
+
+
+class DdsArticle(Base):
+    __tablename__ = "dds_articles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+
+    items: Mapped[list["RequestItem"]] = relationship(
+        back_populates="dds_article",
+        lazy="raise",
+    )
 
 
 class RequestStatus(Base):
@@ -62,9 +108,8 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     tg_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
-    tg_username: Mapped[str | None] = mapped_column(String(100), unique=True)
+    tg_username: Mapped[str | None] = mapped_column(String(100))
     full_name: Mapped[str | None] = mapped_column(String(200))
-    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"), nullable=False)
     department_id: Mapped[int | None] = mapped_column(ForeignKey("departments.id"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_default_approver: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -73,7 +118,9 @@ class User(Base):
         DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow
     )
 
-    role: Mapped["Role"] = relationship(back_populates="users", lazy="raise")
+    roles: Mapped[list["Role"]] = relationship(
+        secondary=user_roles, back_populates="users", lazy="raise"
+    )
     department: Mapped["Department"] = relationship(back_populates="users", lazy="raise")
     created_requests: Mapped[list["Request"]] = relationship(
         back_populates="initiator",
@@ -158,10 +205,21 @@ class RequestItem(Base):
     unit: Mapped[str | None] = mapped_column(String(50))
     link: Mapped[str | None] = mapped_column(Text)
     note: Mapped[str | None] = mapped_column(Text)
+    max_price: Mapped[str | None] = mapped_column(String(50))
+    omts_responsible_id: Mapped[int | None] = mapped_column(
+        ForeignKey("omts_responsibles.id")
+    )
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("request_categories.id"))
+    dds_article_id: Mapped[int | None] = mapped_column(ForeignKey("dds_articles.id"))
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
     request: Mapped["Request"] = relationship(back_populates="items", lazy="raise")
     attachments: Mapped[list["Attachment"]] = relationship(back_populates="item", lazy="raise")
+    omts_responsible: Mapped["OmtsResponsible"] = relationship(
+        back_populates="items", lazy="raise"
+    )
+    category: Mapped["RequestCategory"] = relationship(back_populates="items", lazy="raise")
+    dds_article: Mapped["DdsArticle"] = relationship(back_populates="items", lazy="raise")
 
 
 class Approval(Base):

@@ -1,11 +1,12 @@
 import asyncio
 import logging
+from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, FSInputFile
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
 from app.bot.keyboards import (
@@ -15,24 +16,30 @@ from app.bot.keyboards import (
     attachments_done_keyboard,
     cfo_keyboard,
     departments_keyboard,
-    description_method_keyboard,
+    request_method_keyboard,
 )
 from app.bot.states import RequestCreate
 from app.db.models import (
     Approval,
     ApprovalStatus,
     Attachment,
+    Cfo,
+    DdsArticle,
+    Department,
+    OmtsResponsible,
     Request,
+    RequestCategory,
     RequestItem,
     RequestStatus,
     Role,
     User,
+    user_roles,
 )
 from app.db.session import SessionLocal
 from app.services.constants import APPROVAL_STATUS_PENDING, REQUEST_STATUS_PENDING
 from app.config import settings
 from app.services.attachments import build_photo_groups_from, fetch_request_media
-from app.services.excel import build_request_xlsx
+from app.services.excel import TemplateParseError, build_request_xlsx, parse_request_template
 from app.services.files import save_telegram_file, save_bytes_file
 from app.services.formatters import format_request_summary
 from app.services.notifications import send_to_user
@@ -97,6 +104,40 @@ async def _flush_album(key: tuple[int, str], state: FSMContext) -> None:
 
 async def _get_status_id(session, model, code: str) -> int:
     return await session.scalar(select(model.id).where(model.code == code))
+
+
+def _normalize_key(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+async def _get_or_create_reference(session, model, name: str | None, cache: dict[str, int]) -> int | None:
+    if not name:
+        return None
+    normalized_name = " ".join(name.split())
+    key = _normalize_key(normalized_name)
+    if not key:
+        return None
+    if key in cache:
+        return cache[key]
+    obj = await session.scalar(select(model).where(func.lower(func.trim(model.name)) == key))
+    if not obj:
+        obj = model(name=normalized_name)
+        session.add(obj)
+        await session.flush()
+    cache[key] = obj.id
+    return obj.id
+
+
+async def _fetch_approvers(session) -> list[tuple[int, str]]:
+    rows = await session.execute(
+        select(User.id, User.full_name)
+        .join(user_roles, user_roles.c.user_id == User.id)
+        .join(Role, Role.id == user_roles.c.role_id)
+        .where(Role.code.in_(["approver", "chief_approver"]))
+        .distinct()
+        .order_by(User.full_name, User.id)
+    )
+    return [(row[0], row[1]) for row in rows.all()]
 
 
 async def _send_request_with_attachments(
@@ -212,16 +253,177 @@ async def _get_next_pending_approval(session, request_id: int):
 @router.message(F.text == "📝 Создать заявку")
 async def create_request_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await state.set_state(RequestCreate.full_name)
-    await message.answer("Введите ваше ФИО")
+    await state.set_state(RequestCreate.method)
+    await message.answer(
+        "Как будете создавать заявку?", reply_markup=request_method_keyboard()
+    )
+
+
+@router.callback_query(RequestCreate.method, F.data.startswith("req_method:"))
+async def create_request_method(callback: CallbackQuery, state: FSMContext) -> None:
+    method = callback.data.split(":")[1]
+    try:
+        await callback.answer()
+    except TelegramBadRequest:
+        pass
+    if method == "manual":
+        await state.update_data(full_name=callback.from_user.full_name.strip())
+        await _prompt_departments(callback.message, state)
+    else:
+        await state.set_state(RequestCreate.excel_file)
+        await callback.message.answer("Загрузите Excel файл по шаблону.")
+
+
+@router.message(RequestCreate.excel_file)
+async def create_request_excel_file(message: Message, state: FSMContext) -> None:
+    if not message.document:
+        await message.answer("Пожалуйста, отправьте Excel файл (.xlsx).")
+        return
+    file_name = message.document.file_name or ""
+    if Path(file_name).suffix.lower() != ".xlsx":
+        await message.answer("Нужен файл формата .xlsx. Проверьте и отправьте заново.")
+        return
+
+    file_path = await save_telegram_file(
+        message.bot,
+        message.document.file_id,
+        dest_dir=settings.files_dir,
+        filename_hint=file_name,
+    )
+    try:
+        parsed = parse_request_template(file_path)
+    except TemplateParseError as exc:
+        await message.answer(str(exc))
+        await state.clear()
+        try:
+            Path(file_path).unlink()
+        except FileNotFoundError:
+            pass
+        return
+    except Exception:
+        logger.exception("Failed to parse request template")
+        await message.answer("Не удалось прочитать Excel файл. Проверьте шаблон и загрузите заново.")
+        await state.clear()
+        try:
+            Path(file_path).unlink()
+        except FileNotFoundError:
+            pass
+        return
+
+    async with SessionLocal() as session:
+        initiator_rows = (
+            await session.execute(
+                select(User).where(User.full_name == parsed["initiator_name"])
+            )
+        ).scalars().all()
+        if not initiator_rows:
+            await message.answer(
+                "Инициатор из ячейки G2 не найден в базе пользователей. "
+                "Исправьте ФИО и загрузите файл заново."
+            )
+            await state.clear()
+            try:
+                Path(file_path).unlink()
+            except FileNotFoundError:
+                pass
+            return
+        if len(initiator_rows) > 1:
+            await message.answer(
+                "Найдено несколько пользователей с таким ФИО инициатора. "
+                "Уточните ФИО в базе и загрузите файл заново."
+            )
+            await state.clear()
+            try:
+                Path(file_path).unlink()
+            except FileNotFoundError:
+                pass
+            return
+        initiator = initiator_rows[0]
+
+        dep_rows = await session.execute(select(Department.id, Department.name))
+        department_map = {
+            _normalize_key(name): (dep_id, name) for dep_id, name in dep_rows.all()
+        }
+        cfo_rows = await session.execute(select(Cfo.id, Cfo.name))
+        cfo_map = {
+            _normalize_key(name): (cfo_id, name) for cfo_id, name in cfo_rows.all()
+        }
+        if not cfo_map:
+            await message.answer("В базе нет ЦФО. Загрузка заявки невозможна.")
+            await state.clear()
+            try:
+                Path(file_path).unlink()
+            except FileNotFoundError:
+                pass
+            return
+
+        excel_groups = []
+        for group in parsed["groups"]:
+            dept_key = _normalize_key(group["department_name"])
+            dept = department_map.get(dept_key)
+            if not dept:
+                await message.answer(
+                    f"Подразделение «{group['department_name']}» не найдено в базе. "
+                    "Исправьте файл и загрузите заново."
+                )
+                await state.clear()
+                try:
+                    Path(file_path).unlink()
+                except FileNotFoundError:
+                    pass
+                return
+            cfo_key = _normalize_key(group["cfo_name"])
+            cfo = cfo_map.get(cfo_key)
+            if not cfo:
+                await message.answer(
+                    f"ЦФО «{group['cfo_name']}» не найдено в базе. "
+                    "Исправьте файл и загрузите заново."
+                )
+                await state.clear()
+                try:
+                    Path(file_path).unlink()
+                except FileNotFoundError:
+                    pass
+                return
+            excel_groups.append(
+                {
+                    "department_id": dept[0],
+                    "department_name": dept[1],
+                    "cfo_id": cfo[0],
+                    "mol_full_name": group["mol_full_name"],
+                    "items": group["items"],
+                }
+            )
+
+    if not excel_groups:
+        await message.answer("В файле нет данных для создания заявки.")
+        await state.clear()
+        try:
+            Path(file_path).unlink()
+        except FileNotFoundError:
+            pass
+        return
+
+    await state.update_data(
+        initiator_id=initiator.id,
+        full_name=initiator.full_name,
+        description_method="excel",
+        excel_file_path=file_path,
+        excel_file_name=file_name,
+        excel_groups=excel_groups,
+        excel_group_index=0,
+    )
+    await _prompt_excel_approver(message, state)
 
 
 @router.message(RequestCreate.full_name)
 async def create_request_full_name(message: Message, state: FSMContext) -> None:
     await state.update_data(full_name=message.text.strip())
-    async with SessionLocal() as session:
-        from app.db.models import Department
+    await _prompt_departments(message, state)
 
+
+async def _prompt_departments(message: Message, state: FSMContext) -> None:
+    async with SessionLocal() as session:
         dep_rows = await session.execute(
             select(Department.id, Department.name).order_by(Department.name)
         )
@@ -235,8 +437,6 @@ async def create_request_department(callback: CallbackQuery, state: FSMContext) 
     dep_id = int(callback.data.split(":")[1])
     await state.update_data(department_id=dep_id)
     async with SessionLocal() as session:
-        from app.db.models import Cfo
-
         rows = await session.execute(select(Cfo.id, Cfo.name).order_by(Cfo.name))
         cfos = rows.all()
     await state.set_state(RequestCreate.cfo)
@@ -247,11 +447,9 @@ async def create_request_department(callback: CallbackQuery, state: FSMContext) 
 @router.callback_query(RequestCreate.cfo, F.data.startswith("cfo:"))
 async def create_request_cfo(callback: CallbackQuery, state: FSMContext) -> None:
     cfo_id = int(callback.data.split(":")[1])
-    await state.update_data(cfo_id=cfo_id)
-    await state.set_state(RequestCreate.description_method)
-    await callback.message.answer(
-        "Описание закупаемого товара", reply_markup=description_method_keyboard()
-    )
+    await state.update_data(cfo_id=cfo_id, description_method="manual", items=[])
+    await state.set_state(RequestCreate.item_name)
+    await callback.message.answer("Наименование")
     await callback.answer()
 
 
@@ -260,7 +458,9 @@ async def create_request_description_method(callback: CallbackQuery, state: FSMC
     method = callback.data.split(":")[1]
     await state.update_data(description_method=method)
     if method == "excel":
-        await callback.message.answer("Функционал загрузки Excel пока в разработке.")
+        await callback.message.answer(
+            "Для загрузки Excel выберите этот вариант в начале создания заявки."
+        )
         await state.clear()
         await callback.answer()
         return
@@ -461,16 +661,36 @@ async def create_request_item_more(callback: CallbackQuery, state: FSMContext) -
 async def create_request_mol(message: Message, state: FSMContext) -> None:
     await state.update_data(mol_full_name=message.text.strip())
     async with SessionLocal() as session:
-        rows = await session.execute(
-            select(User.id, User.full_name)
-            .join(Role, Role.id == User.role_id)
-            .where(Role.code.in_(["approver", "chief_approver"]))
-            .order_by(User.full_name)
-        )
-        approvers = [(row[0], row[1]) for row in rows.all()]
+        approvers = await _fetch_approvers(session)
     await state.set_state(RequestCreate.approver_choice)
     await message.answer(
         "Выберите согласующего руководителя", reply_markup=approver_keyboard(approvers)
+    )
+
+
+async def _prompt_excel_approver(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    groups = data.get("excel_groups") or []
+    index = data.get("excel_group_index", 0)
+    if index >= len(groups):
+        await state.clear()
+        await message.answer("Загрузка заявок завершена.")
+        return
+    group = groups[index]
+    await state.update_data(
+        department_id=group["department_id"],
+        cfo_id=group["cfo_id"],
+        items=group["items"],
+        mol_full_name=group["mol_full_name"],
+        description_method="excel",
+    )
+    async with SessionLocal() as session:
+        approvers = await _fetch_approvers(session)
+    await state.set_state(RequestCreate.approver_choice)
+    await message.answer(
+        f"Заявка из файла для подразделения «{group['department_name']}». "
+        "Выберите согласующего руководителя",
+        reply_markup=approver_keyboard(approvers),
     )
 
 
@@ -480,22 +700,42 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
     data = await state.get_data()
 
     async with SessionLocal() as session:
-        username = await ensure_username_format(callback.from_user.username)
-        initiator = await get_or_create_user(
-            session, callback.from_user.id, username, data.get("full_name")
-        )
+        initiator_id = data.get("initiator_id")
+        is_excel = data.get("description_method") == "excel"
+        excel_file_path = data.get("excel_file_path")
+        excel_file_name = data.get("excel_file_name") or "request_template.xlsx"
+        if initiator_id:
+            initiator = await session.get(User, initiator_id)
+            if not initiator:
+                await callback.message.answer(
+                    "Инициатор из файла не найден. Загрузка заявки остановлена."
+                )
+                await state.clear()
+                await callback.answer()
+                return
+        else:
+            username = await ensure_username_format(callback.from_user.username)
+            initiator = await get_or_create_user(
+                session, callback.from_user.id, username, data.get("full_name")
+            )
+
         initiator.department_id = data.get("department_id")
 
         status_id = await _get_status_id(session, RequestStatus, REQUEST_STATUS_PENDING)
         items = data.get("items") or []
-        primary_item = items[0] if items else {}
+        if not items:
+            await callback.message.answer("В заявке нет товаров. Проверьте данные.")
+            await state.clear()
+            await callback.answer()
+            return
+        primary_item = items[0]
 
         request = Request(
             status_id=status_id,
             initiator_id=initiator.id,
             department_id=data["department_id"],
             cfo_id=data["cfo_id"],
-            description_method=data["description_method"],
+            description_method=data.get("description_method", "manual"),
             item_name=primary_item.get("name"),
             item_specs=primary_item.get("specs"),
             item_brand=primary_item.get("brand"),
@@ -508,7 +748,21 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
         session.add(request)
         await session.flush()
 
+        ref_cache = {
+            "omts": {},
+            "category": {},
+            "dds": {},
+        }
         for item in items:
+            omts_id = await _get_or_create_reference(
+                session, OmtsResponsible, item.get("omts_responsible"), ref_cache["omts"]
+            )
+            category_id = await _get_or_create_reference(
+                session, RequestCategory, item.get("category"), ref_cache["category"]
+            )
+            dds_article_id = await _get_or_create_reference(
+                session, DdsArticle, item.get("dds_article"), ref_cache["dds"]
+            )
             item_row = RequestItem(
                 request_id=request.id,
                 name=item.get("name"),
@@ -518,6 +772,10 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
                 unit=item.get("unit"),
                 link=item.get("link"),
                 note=item.get("note"),
+                max_price=item.get("max_price"),
+                omts_responsible_id=omts_id,
+                category_id=category_id,
+                dds_article_id=dds_article_id,
             )
             session.add(item_row)
             await session.flush()
@@ -546,6 +804,27 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
                     )
                 )
 
+        if is_excel:
+            if not excel_file_path:
+                await callback.message.answer(
+                    "Файл Excel не найден. Загрузка заявки остановлена."
+                )
+                await state.clear()
+                await callback.answer()
+                return
+            session.add(
+                Attachment(
+                    request_id=request.id,
+                    uploader_id=initiator.id,
+                    item_id=None,
+                    file_id=None,
+                    file_unique_id=None,
+                    file_name=excel_file_name,
+                    file_path=excel_file_path,
+                    file_type="document",
+                )
+            )
+
         approval_status_id = await _get_status_id(
             session, ApprovalStatus, APPROVAL_STATUS_PENDING
         )
@@ -557,18 +836,6 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
                 return
             seen_ids.add(user.id)
             ordered_approvers.append(user)
-
-        default_order = [
-            "Гайнутдинов Руслан Фаргатович",
-            "Тихонова Людмила Васильевна",
-        ]
-        if default_order:
-            rows = await session.execute(
-                select(User).where(User.full_name.in_(default_order))
-            )
-            defaults_by_name = {user.full_name: user for user in rows.scalars().all()}
-            for name in default_order:
-                _add_approver(defaults_by_name.get(name))
 
         extra_defaults = (
             await session.execute(
@@ -586,7 +853,8 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
         chiefs = (
             await session.execute(
                 select(User)
-                .join(Role, Role.id == User.role_id)
+                .join(user_roles, user_roles.c.user_id == User.id)
+                .join(Role, Role.id == user_roles.c.role_id)
                 .where(Role.code == "chief_approver")
                 .order_by(User.full_name)
             )
@@ -606,37 +874,38 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
 
         await session.commit()
 
-        refreshed = await session.execute(
-            select(Request)
-            .where(Request.id == request.id)
-            .options(
-                selectinload(Request.initiator),
-                selectinload(Request.department),
-                selectinload(Request.cfo),
-                selectinload(Request.status),
-                selectinload(Request.items),
-                selectinload(Request.attachments),
+        if not is_excel:
+            refreshed = await session.execute(
+                select(Request)
+                .where(Request.id == request.id)
+                .options(
+                    selectinload(Request.initiator),
+                    selectinload(Request.department),
+                    selectinload(Request.cfo),
+                    selectinload(Request.status),
+                    selectinload(Request.items),
+                    selectinload(Request.attachments),
+                )
+                .execution_options(populate_existing=True)
             )
-            .execution_options(populate_existing=True)
-        )
-        request = refreshed.scalar_one()
+            request = refreshed.scalar_one()
 
-        items, attachments = await fetch_request_media(session, request.id)
-        excel_content = build_request_xlsx(request, items, attachments)
-        excel_name = f"request_{request.id}.xlsx"
-        excel_path = save_bytes_file(excel_content, settings.files_dir, excel_name)
-        session.add(
-            Attachment(
-                request_id=request.id,
-                uploader_id=initiator.id,
-                file_id=None,
-                file_unique_id=None,
-                file_name=excel_name,
-                file_path=excel_path,
-                file_type="document",
+            items, attachments = await fetch_request_media(session, request.id)
+            excel_content = build_request_xlsx(request, items, attachments)
+            excel_name = f"request_{request.id}.xlsx"
+            excel_path = save_bytes_file(excel_content, settings.files_dir, excel_name)
+            session.add(
+                Attachment(
+                    request_id=request.id,
+                    uploader_id=initiator.id,
+                    file_id=None,
+                    file_unique_id=None,
+                    file_name=excel_name,
+                    file_path=excel_path,
+                    file_type="document",
+                )
             )
-        )
-        await session.commit()
+            await session.commit()
 
         refreshed = await session.execute(
             select(Request)
@@ -686,6 +955,15 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
                         "Примите решение по заявке:",
                         reply_markup=approval_action_keyboard(approval.id),
                     )
+
+    excel_groups = data.get("excel_groups")
+    if excel_groups:
+        next_index = data.get("excel_group_index", 0) + 1
+        if next_index < len(excel_groups):
+            await state.update_data(excel_group_index=next_index)
+            await _prompt_excel_approver(callback.message, state)
+            await callback.answer()
+            return
 
     await state.clear()
     await callback.answer()

@@ -2,19 +2,29 @@ from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 
-def main_menu_keyboard(role_code: str) -> ReplyKeyboardMarkup:
+def main_menu_keyboard(role_codes) -> ReplyKeyboardMarkup:
+    codes = {role_codes} if isinstance(role_codes, str) else set(role_codes or [])
     builder = ReplyKeyboardBuilder()
     builder.button(text="📝 Создать заявку")
+    builder.button(text="📥 Скачать шаблон заявки")
     builder.button(text="📚 Архив")
-    if role_code == "executor":
+    if "executor" in codes:
         builder.button(text="📌 Мои заявки")
-        builder.button(text="📤 Ежедневные заявки")
-        builder.button(text="📊 Статистика сотрудников")
+        builder.button(text="📤 Выгрузить ежедневные заявки")
+        builder.button(text="📊 Выгрузить статистику сотрудников")
         builder.button(text="📅 Срок поставки")
-    if role_code == "admin":
+    if "admin" in codes:
         builder.button(text="⚙️ Настройки")
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
+
+
+def request_method_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✍️ Вручную", callback_data="req_method:manual")
+    builder.button(text="📄 Загрузить Excel", callback_data="req_method:excel")
+    builder.adjust(1)
+    return builder.as_markup()
 
 
 def departments_keyboard(items: list[tuple[int, str]]) -> InlineKeyboardMarkup:
@@ -88,10 +98,8 @@ def executor_actions_keyboard(
     builder = InlineKeyboardBuilder()
     builder.button(text="🛠️ В работу", callback_data=f"status:{request_id}:in_work")
     builder.button(text="✅ Выполнена", callback_data=f"status:{request_id}:done")
-    builder.button(text="❌ Отклонена", callback_data=f"status:{request_id}:rejected")
     if include_extras:
         builder.button(text="💬 Комментарий", callback_data=f"comment:{request_id}")
-        builder.button(text="📎 Файл", callback_data=f"file:{request_id}")
         builder.button(text="📅 Срок поставки", callback_data=f"delivery:{request_id}")
         builder.adjust(2)
     else:
@@ -136,6 +144,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="🏢 Подразделения", callback_data="settings:departments")
     builder.button(text="🏷️ ЦФО", callback_data="settings:cfos")
     builder.button(text="👥 Пользователи", callback_data="settings:users")
+    builder.button(text="📝 Заявки", callback_data="settings:requests")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -162,4 +171,117 @@ def roles_keyboard(items: list[tuple[int, str]]) -> InlineKeyboardMarkup:
         icon = role_icons.get(name, "👤")
         builder.button(text=f"{icon} {name}", callback_data=f"role:{role_id}")
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def users_menu_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Добавить пользователя", callback_data="users:add")
+    builder.button(text="👤 Инициаторы", callback_data="users:list:employee")
+    builder.button(text="✅ Руководители", callback_data="users:list:leaders")
+    builder.button(text="🧑‍🔧 Исполнители", callback_data="users:list:executor")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def users_list_keyboard(role_key: str, items: list[tuple[int, str, bool]]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for user_id, name, is_active in items:
+        prefix = "🟢" if is_active else "🔴"
+        builder.button(
+            text=f"{prefix} {name}",
+            callback_data=f"users:toggle:{role_key}:{user_id}",
+        )
+    builder.button(text="➕ Добавить", callback_data="users:add")
+    builder.button(text="⬅️ Назад", callback_data="settings:users")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def request_edit_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Реквизиты", callback_data=f"req_edit:fields:{request_id}")
+    builder.button(text="🧾 Товары", callback_data=f"req_edit:items:{request_id}")
+    builder.button(text="➕ Добавить товар", callback_data=f"req_edit:item_add:{request_id}")
+    builder.button(text="⬅️ Назад", callback_data="settings:requests")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def request_fields_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👤 Инициатор", callback_data=f"req_edit_field:{request_id}:initiator")
+    builder.button(text="🏢 Подразделение", callback_data=f"req_edit_field:{request_id}:department")
+    builder.button(text="🏷️ ЦФО", callback_data=f"req_edit_field:{request_id}:cfo")
+    builder.button(text="👔 МОЛ", callback_data=f"req_edit_field:{request_id}:mol")
+    builder.button(text="📌 Статус", callback_data=f"req_edit_field:{request_id}:status")
+    builder.button(text="🧑‍🔧 Исполнитель", callback_data=f"req_edit_field:{request_id}:executor")
+    builder.button(text="🏭 Поставщик", callback_data=f"req_edit_field:{request_id}:supplier")
+    builder.button(text="📅 Срок поставки", callback_data=f"req_edit_field:{request_id}:delivery")
+    builder.button(text="⬅️ Назад", callback_data=f"req_edit:menu:{request_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def request_items_keyboard(
+    request_id: int, items: list[tuple[int, str]]
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for item_id, name in items:
+        label = name or "-"
+        builder.button(
+            text=label,
+            callback_data=f"req_item:{request_id}:{item_id}",
+        )
+    builder.button(text="➕ Добавить товар", callback_data=f"req_edit:item_add:{request_id}")
+    builder.button(text="⬅️ Назад", callback_data=f"req_edit:menu:{request_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def request_item_fields_keyboard(request_id: int, item_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Наименование", callback_data=f"req_item_field:{request_id}:{item_id}:name")
+    builder.button(text="Характеристики", callback_data=f"req_item_field:{request_id}:{item_id}:specs")
+    builder.button(text="Марка/аналог", callback_data=f"req_item_field:{request_id}:{item_id}:brand")
+    builder.button(text="Количество", callback_data=f"req_item_field:{request_id}:{item_id}:qty")
+    builder.button(text="Ед.", callback_data=f"req_item_field:{request_id}:{item_id}:unit")
+    builder.button(text="Ссылка", callback_data=f"req_item_field:{request_id}:{item_id}:link")
+    builder.button(text="Примечание", callback_data=f"req_item_field:{request_id}:{item_id}:note")
+    builder.button(text="Макс. цена", callback_data=f"req_item_field:{request_id}:{item_id}:max_price")
+    builder.button(
+        text="Ответственный ОМТС",
+        callback_data=f"req_item_field:{request_id}:{item_id}:omts",
+    )
+    builder.button(
+        text="Категория",
+        callback_data=f"req_item_field:{request_id}:{item_id}:category",
+    )
+    builder.button(
+        text="Статья ДДС",
+        callback_data=f"req_item_field:{request_id}:{item_id}:dds",
+    )
+    builder.button(text="🗑️ Удалить", callback_data=f"req_item_field:{request_id}:{item_id}:delete")
+    builder.button(text="⬅️ Назад", callback_data=f"req_edit:items:{request_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def request_status_keyboard(items: list[tuple[int, str]], request_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for status_id, name in items:
+        builder.button(
+            text=name,
+            callback_data=f"req_status:{request_id}:{status_id}",
+        )
+    builder.button(text="⬅️ Назад", callback_data=f"req_edit:fields:{request_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def export_edit_keyboard(report_type: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да", callback_data=f"export_edit:{report_type}:yes")
+    builder.button(text="❌ Нет", callback_data=f"export_edit:{report_type}:no")
+    builder.adjust(2)
     return builder.as_markup()

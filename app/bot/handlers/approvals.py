@@ -16,6 +16,7 @@ from app.db.models import (
     RequestStatus,
     Role,
     User,
+    user_roles,
 )
 from app.db.session import SessionLocal
 from app.config import settings
@@ -30,7 +31,7 @@ from app.services.attachments import build_photo_groups_from, fetch_request_medi
 from app.services.excel import upsert_request_excel
 from app.services.formatters import format_request_summary
 from app.services.notifications import send_to_user
-from app.services.users import ensure_username_format
+from app.services.users import ensure_username_format, user_has_role
 from app.services.datetime import to_naive_utc
 
 router = Router()
@@ -62,6 +63,7 @@ async def _load_request_full(session, request_id: int) -> Request | None:
             selectinload(Request.status),
             selectinload(Request.attachments),
             selectinload(Request.items),
+            selectinload(Request.comments),
         )
         .execution_options(populate_existing=True)
     )
@@ -219,7 +221,8 @@ async def approval_accept(callback: CallbackQuery) -> None:
         executors = (
             await session.execute(
                 select(User.id, User.full_name)
-                .join(Role, Role.id == User.role_id)
+                .join(user_roles, user_roles.c.user_id == User.id)
+                .join(Role, Role.id == user_roles.c.role_id)
                 .where(Role.code == "executor")
                 .order_by(User.full_name)
             )
@@ -237,12 +240,10 @@ async def approval_accept(callback: CallbackQuery) -> None:
             )
             return
 
-        if approver.role_id:
-            approver_role = await session.scalar(select(Role.code).where(Role.id == approver.role_id))
-        else:
-            approver_role = None
-        if approver_role == "chief_approver" and approver.tg_id:
-            await send_to_user(callback.bot, approver, format_request_summary(request))
+        if await user_has_role(session, approver.id, "chief_approver") and approver.tg_id:
+            await _send_request_with_attachments_to_chat(
+                callback.bot, request, approver.tg_id, items, attachments
+            )
             await send_to_user(
                 callback.bot,
                 approver,
@@ -252,11 +253,18 @@ async def approval_accept(callback: CallbackQuery) -> None:
         else:
             chiefs = (
                 await session.execute(
-                    select(User).join(Role, Role.id == User.role_id).where(Role.code == "chief_approver")
+                    select(User)
+                    .join(user_roles, user_roles.c.user_id == User.id)
+                    .join(Role, Role.id == user_roles.c.role_id)
+                    .where(Role.code == "chief_approver")
                 )
             ).scalars().all()
             for chief in chiefs:
-                await send_to_user(callback.bot, chief, format_request_summary(request))
+                if not chief.tg_id:
+                    continue
+                await _send_request_with_attachments_to_chat(
+                    callback.bot, request, chief.tg_id, items, attachments
+                )
                 await send_to_user(
                     callback.bot,
                     chief,
@@ -376,11 +384,13 @@ async def leader_comment_save(message: Message, state: FSMContext) -> None:
             approval.request_id,
             options=[selectinload(Request.initiator)],
         )
+        author_name = approver.full_name or approver.tg_username or f"ID {approver.id}"
+        comment_text = message.text.strip()
         session.add(
             Comment(
                 request_id=request.id,
                 author_id=approver.id,
-                text=message.text.strip(),
+                text=f"Комментарий от {author_name} - {comment_text}",
             )
         )
         await session.commit()
@@ -394,7 +404,8 @@ async def leader_comment_save(message: Message, state: FSMContext) -> None:
         leaders = (
             await session.execute(
                 select(User)
-                .join(Role, Role.id == User.role_id)
+                .join(user_roles, user_roles.c.user_id == User.id)
+                .join(Role, Role.id == user_roles.c.role_id)
                 .where(Role.code.in_(["approver", "chief_approver"]))
             )
         ).scalars().all()

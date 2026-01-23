@@ -2,7 +2,7 @@ from datetime import datetime, time, timedelta
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
@@ -10,6 +10,7 @@ from app.bot.keyboards import archive_status_keyboard, skip_keyboard
 from app.bot.states import ArchiveFilter
 from app.db.models import Request, RequestItem, RequestStatus, User
 from app.db.session import SessionLocal
+from app.services.excel import build_archive_xlsx
 from app.services.users import ensure_username_format, get_or_create_user
 
 router = Router()
@@ -181,16 +182,16 @@ async def _archive_finish(message: Message, state: FSMContext) -> None:
             date_to_end = datetime.combine(date_to, time.min) + timedelta(days=1)
             query = query.where(Request.created_at < date_to_end)
 
-        rows = await session.execute(query.order_by(Request.created_at.desc()).limit(50))
+        rows = await session.execute(query.order_by(Request.created_at.desc()))
         requests = rows.scalars().all()
 
     if not requests:
         await message.answer("По вашему запросу заявок не найдено.")
         return
-    for req in requests:
-        from app.services.formatters import format_request_summary
-
-        await message.answer(format_request_summary(req))
+    await message.answer("Формирую Excel файл, пожалуйста подождите...")
+    content = build_archive_xlsx(requests)
+    filename = f"archive_requests_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    await message.answer_document(BufferedInputFile(content, filename=filename))
 
 
 def _parse_date(value: str | None):

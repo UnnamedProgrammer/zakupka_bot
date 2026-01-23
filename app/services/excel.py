@@ -1,81 +1,510 @@
 from io import BytesIO
+from pathlib import Path
 from typing import Iterable
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from sqlalchemy import select
+from sqlalchemy import select, inspect
 from sqlalchemy.orm import selectinload
 
 from app.db.models import Attachment, Request, RequestItem
 from app.services.files import save_bytes_file
 
 
-def build_daily_requests_xlsx(requests: Iterable[Request]) -> bytes:
-    wb = Workbook()
+class TemplateParseError(Exception):
+    pass
+
+
+class ReportParseError(Exception):
+    pass
+
+
+REQUEST_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "request_template.xlsx"
+
+
+REQUESTS_REPORT_HEADERS = [
+    "ID",
+    "Дата создания",
+    "Дата обновления",
+    "Инициатор",
+    "Подразделение",
+    "ЦФО",
+    "МОЛ",
+    "Статус",
+    "Исполнитель",
+    "Поставщик",
+    "Срок поставки",
+    "Дата согласования",
+    "Дата выполнения",
+    "Дата получения",
+    "Способ описания",
+    "Товары",
+    "Комментарии",
+]
+
+
+def _get_loaded(obj, attr: str):
+    state = inspect(obj)
+    if attr in state.unloaded:
+        return None
+    return getattr(obj, attr)
+
+
+def _normalize_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip()
+    return " ".join(text.split())
+
+
+def _normalize_header(value) -> str:
+    return _normalize_cell(value).casefold()
+
+
+def parse_request_template(path: str) -> dict:
+    wb = load_workbook(path, data_only=True)
     ws = wb.active
-    ws.title = "Ежедневные заявки"
-    ws.append(
-        [
-            "ID",
-            "Дата",
-            "Инициатор",
-            "Подразделение",
-            "ЦФО",
-            "Наименование",
-            "Количество",
-            "Ед.",
-            "Статус",
-            "Исполнитель",
-        ]
-    )
-    for req in requests:
-        ws.append(
-            [
-                req.id,
-                req.created_at.strftime("%Y-%m-%d"),
-                req.initiator.full_name or "",
-                req.department.name,
-                req.cfo.name,
-                req.item_name or "",
-                req.item_qty or "",
-                req.item_unit or "",
-                req.status.name,
-                req.executor.full_name if req.executor else "",
-            ]
+
+    initiator_name = _normalize_cell(ws["G2"].value)
+    if not initiator_name:
+        raise TemplateParseError("В ячейке G2 не указан инициатор заявки.")
+
+    groups: dict[str, dict] = {}
+    group_order: list[str] = []
+    rows_found = 0
+
+    for row_idx in range(6, ws.max_row + 1):
+        values = [_normalize_cell(ws.cell(row=row_idx, column=col).value) for col in range(1, 13)]
+        if not any(values):
+            if rows_found:
+                break
+            continue
+        rows_found += 1
+
+        (
+            omts_responsible,
+            category,
+            name,
+            specs,
+            dds_article,
+            qty,
+            unit,
+            max_price,
+            department,
+            cfo_name,
+            mol_full_name,
+            note,
+        ) = values
+
+        if not name:
+            raise TemplateParseError(f"Строка {row_idx}: не заполнено \"Наименование\".")
+        if not qty:
+            raise TemplateParseError(f"Строка {row_idx}: не заполнено \"Кол-во\".")
+        if not unit:
+            raise TemplateParseError(f"Строка {row_idx}: не заполнено \"Ед. измерения\".")
+        if not department:
+            raise TemplateParseError(f"Строка {row_idx}: не заполнено \"Подразделение\".")
+        if not cfo_name:
+            raise TemplateParseError(f"Строка {row_idx}: не заполнено \"ЦФО\".")
+        if not mol_full_name:
+            raise TemplateParseError(f"Строка {row_idx}: не заполнено \"МОЛ\".")
+
+        dept_key = department.casefold()
+        group = groups.get(dept_key)
+        if not group:
+            group = {
+                "department_name": department,
+                "cfo_name": cfo_name,
+                "mol_full_name": mol_full_name,
+                "items": [],
+            }
+            groups[dept_key] = group
+            group_order.append(dept_key)
+        elif group["cfo_name"].casefold() != cfo_name.casefold():
+            raise TemplateParseError(
+                f"Строка {row_idx}: для подразделения \"{group['department_name']}\" указан другой ЦФО."
+            )
+        elif group["mol_full_name"].casefold() != mol_full_name.casefold():
+            raise TemplateParseError(
+                f"Строка {row_idx}: для подразделения \"{group['department_name']}\" указан другой МОЛ."
+            )
+
+        group["items"].append(
+            {
+                "name": name,
+                "specs": specs or None,
+                "brand": None,
+                "qty": qty,
+                "unit": unit,
+                "link": None,
+                "note": note or None,
+                "omts_responsible": omts_responsible or None,
+                "category": category or None,
+                "dds_article": dds_article or None,
+                "max_price": max_price or None,
+                "attachments": [],
+            }
         )
+
+    if not group_order:
+        raise TemplateParseError("В файле не найдены строки с товарами (начиная с 6-й строки).")
+
+    return {
+        "initiator_name": initiator_name,
+        "groups": [groups[key] for key in group_order],
+    }
+
+
+def build_request_template_xlsx(
+    request: Request,
+    items: Iterable[RequestItem],
+    template_path: str | Path = REQUEST_TEMPLATE_PATH,
+) -> bytes:
+    path = Path(template_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Template not found: {path}")
+    wb = load_workbook(path)
+    ws = wb.active
+
+    initiator = _get_loaded(request, "initiator")
+    department = _get_loaded(request, "department")
+    cfo = _get_loaded(request, "cfo")
+
+    ws["G2"] = initiator.full_name if initiator else ""
+
+    department_name = department.name if department else ""
+    cfo_name = cfo.name if cfo else ""
+    mol_name = request.mol_full_name or ""
+
+    items_list = list(items or [])
+    if not items_list and (
+        request.item_name
+        or request.item_specs
+        or request.item_qty
+        or request.item_unit
+        or request.item_note
+    ):
+        items_list = [
+            RequestItem(
+                name=request.item_name,
+                specs=request.item_specs,
+                qty=request.item_qty,
+                unit=request.item_unit,
+                note=request.item_note,
+            )
+        ]
+
+    row_idx = 6
+    for item in items_list:
+        dds = _get_loaded(item, "dds_article")
+        ws.cell(row=row_idx, column=3, value=item.name)
+        ws.cell(row=row_idx, column=4, value=item.specs)
+        ws.cell(row=row_idx, column=5, value=dds.name if dds else None)
+        ws.cell(row=row_idx, column=6, value=item.qty)
+        ws.cell(row=row_idx, column=7, value=item.unit)
+        ws.cell(row=row_idx, column=8, value=item.max_price)
+        ws.cell(row=row_idx, column=9, value=department_name)
+        ws.cell(row=row_idx, column=10, value=cfo_name)
+        ws.cell(row=row_idx, column=11, value=mol_name)
+        ws.cell(row=row_idx, column=12, value=item.note)
+        row_idx += 1
+
     bio = BytesIO()
     wb.save(bio)
     return bio.getvalue()
+
+
+def parse_requests_report_xlsx(path: str) -> list[dict]:
+    wb = load_workbook(path, data_only=True)
+    ws = wb.active
+
+    header_map: dict[str, int] = {}
+    for col_idx, cell in enumerate(ws[1], start=1):
+        key = _normalize_header(cell.value)
+        if not key:
+            continue
+        if key in header_map:
+            raise ReportParseError(f"Дублирующийся заголовок: {cell.value}")
+        header_map[key] = col_idx
+
+    missing = [
+        header
+        for header in REQUESTS_REPORT_HEADERS
+        if _normalize_header(header) not in header_map
+    ]
+    if missing:
+        raise ReportParseError(
+            "Не найдены заголовки: " + ", ".join(missing)
+        )
+
+    rows: list[dict] = []
+    for row_idx in range(2, ws.max_row + 1):
+        values: dict[str, object | None] = {}
+        is_empty = True
+        for header in REQUESTS_REPORT_HEADERS:
+            col_idx = header_map[_normalize_header(header)]
+            value = ws.cell(row=row_idx, column=col_idx).value
+            if _normalize_cell(value):
+                is_empty = False
+            values[header] = value
+        if is_empty:
+            continue
+        rows.append({"row": row_idx, "values": values})
+
+    if not rows:
+        raise ReportParseError("В файле нет строк для обработки.")
+
+    return rows
+
+
+def _build_items_text(req: Request) -> str:
+    items = _get_loaded(req, "items") or []
+    if items:
+        item_blocks = []
+        for idx, item in enumerate(items, start=1):
+            omts = _get_loaded(item, "omts_responsible")
+            category = _get_loaded(item, "category")
+            dds = _get_loaded(item, "dds_article")
+            item_blocks.append(
+                "\n".join(
+                    [
+                        f"{idx}. Наименование: {item.name or ''}",
+                        f"   Характеристики: {item.specs or ''}",
+                        f"   Марка/аналог: {item.brand or ''}",
+                        f"   Количество: {item.qty or ''}",
+                        f"   Ед.: {item.unit or ''}",
+                        f"   Ссылка: {item.link or '-'}",
+                        f"   Примечание: {item.note or ''}",
+                        f"   Ответственный ОМТС: {omts.name if omts else '-'}",
+                        f"   Категория: {category.name if category else '-'}",
+                        f"   Статья ДДС: {dds.name if dds else '-'}",
+                        f"   Макс. цена: {item.max_price or '-'}",
+                    ]
+                ).strip()
+            )
+        return "\n\n".join(item_blocks).strip()
+    if req.item_name or req.item_specs or req.item_brand or req.item_qty or req.item_unit:
+        return "\n".join(
+            [
+                f"1. Наименование: {req.item_name or ''}",
+                f"   Характеристики: {req.item_specs or ''}",
+                f"   Марка/аналог: {req.item_brand or ''}",
+                f"   Количество: {req.item_qty or ''}",
+                f"   Ед.: {req.item_unit or ''}",
+                f"   Ссылка: {req.item_link or '-'}",
+                f"   Примечание: {req.item_note or ''}",
+            ]
+        ).strip()
+    return ""
+
+
+def _build_comments_text(req: Request) -> str:
+    comments = _get_loaded(req, "comments") or []
+    lines = [comment.text for comment in comments if comment.text]
+    return "\n".join(lines).strip()
+
+
+def _apply_table_formatting(ws, header_len: int) -> None:
+    wrap = Alignment(wrap_text=True, vertical="top")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    bold = Font(bold=True)
+    header_fill = PatternFill("solid", fgColor="D9E1F2")
+    alt_fill = PatternFill("solid", fgColor="F7F7F7")
+    thin = Side(style="thin", color="D0D0D0")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for col in range(1, header_len + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.font = bold
+        cell.alignment = center
+        cell.fill = header_fill
+        cell.border = border
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_col=header_len), start=2):
+        for cell in row:
+            cell.alignment = wrap
+            cell.border = border
+            if row_idx % 2 == 0:
+                cell.fill = alt_fill
+
+    last_col = get_column_letter(header_len)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{last_col}{ws.max_row}"
+
+
+def build_archive_xlsx(requests: Iterable[Request]) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Архив заявок"
+
+    header = [
+        "ID",
+        "Дата создания",
+        "Инициатор",
+        "Подразделение",
+        "ЦФО",
+        "МОЛ",
+        "Статус",
+        "Поставщик",
+        "Товары",
+    ]
+    ws.append(header)
+
+    wrap = Alignment(wrap_text=True, vertical="top")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    bold = Font(bold=True)
+    header_fill = PatternFill("solid", fgColor="D9E1F2")
+    alt_fill = PatternFill("solid", fgColor="F7F7F7")
+    thin = Side(style="thin", color="D0D0D0")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for col in range(1, len(header) + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.font = bold
+        cell.alignment = center
+        cell.fill = header_fill
+        cell.border = border
+
+    for req in requests:
+        items = list(getattr(req, "items", []) or [])
+        if not items:
+            items = [
+                RequestItem(
+                    name=req.item_name,
+                    specs=req.item_specs,
+                    brand=req.item_brand,
+                    qty=req.item_qty,
+                    unit=req.item_unit,
+                    link=req.item_link,
+                    note=req.item_note,
+                )
+            ]
+        item_blocks = []
+        for idx, item in enumerate(items, start=1):
+            item_blocks.append(
+                "\n".join(
+                    [
+                        f"{idx}. Наименование: {item.name or ''}",
+                        f"   Характеристики: {item.specs or ''}",
+                        f"   Марка/аналог: {item.brand or ''}",
+                        f"   Количество: {item.qty or ''}",
+                        f"   Ед.: {item.unit or ''}",
+                        f"   Ссылка: {item.link or '-'}",
+                        f"   Примечание: {item.note or ''}",
+                    ]
+                ).strip()
+            )
+        items_text = "\n\n".join(item_blocks).strip()
+        ws.append(
+            [
+                req.id,
+                req.created_at.strftime("%Y-%m-%d %H:%M") if req.created_at else "",
+                req.initiator.full_name if req.initiator else "",
+                req.department.name if req.department else "",
+                req.cfo.name if req.cfo else "",
+                req.mol_full_name or "",
+                req.status.name if req.status else "",
+                req.supplier_name or "",
+                items_text,
+            ]
+        )
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, max_col=len(header)), start=2):
+        for cell in row:
+            cell.alignment = wrap
+            cell.border = border
+            if row_idx % 2 == 0:
+                cell.fill = alt_fill
+
+    ws.column_dimensions["A"].width = 8
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 22
+    ws.column_dimensions["D"].width = 20
+    ws.column_dimensions["E"].width = 18
+    ws.column_dimensions["F"].width = 16
+    ws.column_dimensions["G"].width = 16
+    ws.column_dimensions["H"].width = 20
+    ws.column_dimensions["I"].width = 40
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:I{ws.max_row}"
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def _build_requests_report_xlsx(requests: Iterable[Request], title: str) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = title
+
+    ws.append(REQUESTS_REPORT_HEADERS)
+
+    for req in requests:
+        created_at = req.created_at.strftime("%Y-%m-%d %H:%M") if req.created_at else ""
+        updated_at = req.updated_at.strftime("%Y-%m-%d %H:%M") if req.updated_at else ""
+        approved_at = req.approved_at.strftime("%Y-%m-%d %H:%M") if req.approved_at else ""
+        done_at = req.done_at.strftime("%Y-%m-%d %H:%M") if req.done_at else ""
+        received_at = req.received_at.strftime("%Y-%m-%d %H:%M") if req.received_at else ""
+        expected_delivery = (
+            req.expected_delivery_at.strftime("%Y-%m-%d") if req.expected_delivery_at else ""
+        )
+        ws.append(
+            [
+                req.id,
+                created_at,
+                updated_at,
+                req.initiator.full_name if req.initiator else "",
+                req.department.name if req.department else "",
+                req.cfo.name if req.cfo else "",
+                req.mol_full_name or "",
+                req.status.name if req.status else "",
+                req.executor.full_name if req.executor else "",
+                req.supplier_name or "",
+                expected_delivery,
+                approved_at,
+                done_at,
+                received_at,
+                req.description_method or "",
+                _build_items_text(req),
+                _build_comments_text(req),
+            ]
+        )
+
+    _apply_table_formatting(ws, len(REQUESTS_REPORT_HEADERS))
+
+    ws.column_dimensions["A"].width = 8
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 22
+    ws.column_dimensions["E"].width = 20
+    ws.column_dimensions["F"].width = 18
+    ws.column_dimensions["G"].width = 18
+    ws.column_dimensions["H"].width = 16
+    ws.column_dimensions["I"].width = 22
+    ws.column_dimensions["J"].width = 20
+    ws.column_dimensions["K"].width = 14
+    ws.column_dimensions["L"].width = 18
+    ws.column_dimensions["M"].width = 18
+    ws.column_dimensions["N"].width = 18
+    ws.column_dimensions["O"].width = 16
+    ws.column_dimensions["P"].width = 55
+    ws.column_dimensions["Q"].width = 40
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def build_daily_requests_xlsx(requests: Iterable[Request]) -> bytes:
+    return _build_requests_report_xlsx(requests, "Ежедневные заявки")
 
 
 def build_employee_stats_xlsx(requests: Iterable[Request]) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Статистика сотрудников"
-    ws.append(
-        [
-            "ID",
-            "Инициатор",
-            "Исполнитель",
-            "Статус",
-            "Дата создания",
-            "Дата выполнения",
-        ]
-    )
-    for req in requests:
-        ws.append(
-            [
-                req.id,
-                req.initiator.full_name or "",
-                req.executor.full_name if req.executor else "",
-                req.status.name,
-                req.created_at.strftime("%Y-%m-%d"),
-                req.updated_at.strftime("%Y-%m-%d"),
-            ]
-        )
-    bio = BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
+    return _build_requests_report_xlsx(requests, "Статистика сотрудников")
 
 
 def build_request_xlsx(
@@ -208,6 +637,8 @@ async def upsert_request_excel(session, request: Request, files_dir: str) -> Non
     )
     req = result.scalar_one_or_none()
     if not req:
+        return
+    if req.description_method == "excel":
         return
     items = (
         await session.scalars(

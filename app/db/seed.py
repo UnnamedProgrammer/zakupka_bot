@@ -7,6 +7,7 @@ from app.db.models import (
     RequestStatus,
     Role,
     User,
+    user_roles,
 )
 
 
@@ -136,10 +137,15 @@ async def _seed_default_users(session) -> None:
             continue
         role_id = roles.get(item["role_code"])
         if role_id:
-            session.add(
-                User(
-                    full_name=item["full_name"],
+            user = User(
+                full_name=item["full_name"],
+                is_default_approver=item.get("is_default_approver", False),
+            )
+            session.add(user)
+            await session.flush()
+            await session.execute(
+                user_roles.insert().values(
+                    user_id=user.id,
                     role_id=role_id,
-                    is_default_approver=item.get("is_default_approver", False),
                 )
             )
