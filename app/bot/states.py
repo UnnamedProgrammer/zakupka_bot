@@ -42,12 +42,10 @@ class ExecutorDeliveryDate(StatesGroup):
 
 
 class ArchiveFilter(StatesGroup):
-    status = State()
-    initiator = State()
-    name = State()
-    supplier = State()
-    date_from = State()
-    date_to = State()
+    menu = State()
+    initiator_input = State()
+    item_input = State()
+    supplier_input = State()
 
 
 class AdminAddDepartment(StatesGroup):
@@ -86,5 +84,10 @@ class AdminEditRequest(StatesGroup):
 
 
 class ExportReportEdit(StatesGroup):
+    confirm = State()
+    file = State()
+
+
+class ArchiveEdit(StatesGroup):
     confirm = State()
     file = State()

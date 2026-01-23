@@ -499,6 +499,10 @@ def _build_requests_report_xlsx(requests: Iterable[Request], title: str) -> byte
     return bio.getvalue()
 
 
+def build_archive_requests_xlsx(requests: Iterable[Request]) -> bytes:
+    return _build_requests_report_xlsx(requests, "Архив заявок")
+
+
 def build_daily_requests_xlsx(requests: Iterable[Request]) -> bytes:
     return _build_requests_report_xlsx(requests, "Ежедневные заявки")
 
