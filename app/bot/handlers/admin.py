@@ -4,7 +4,7 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select, func
+from sqlalchemy import or_, select, func
 from sqlalchemy.orm import selectinload
 
 from app.bot.keyboards import (
@@ -118,20 +118,29 @@ async def _sync_request_primary_item(session, request_id: int) -> None:
 
 
 async def _send_users_list(message: Message, role_key: str) -> None:
-    role_map = {
-        "employee": ["employee"],
-        "executor": ["executor"],
-        "leaders": ["approver", "chief_approver"],
-    }
-    role_codes = role_map.get(role_key, [role_key])
     async with SessionLocal() as session:
-        rows = await session.execute(
-            select(User.id, User.full_name, User.is_active)
-            .join(user_roles, user_roles.c.user_id == User.id)
-            .join(Role, Role.id == user_roles.c.role_id)
-            .where(Role.code.in_(role_codes))
-            .order_by(User.full_name)
-        )
+        if role_key == "leaders":
+            rows = await session.execute(
+                select(User.id, User.full_name, User.is_active)
+                .outerjoin(user_roles, user_roles.c.user_id == User.id)
+                .outerjoin(Role, Role.id == user_roles.c.role_id)
+                .where(or_(Role.code == "approver", User.is_default_approver.is_(True)))
+                .distinct()
+                .order_by(User.full_name, User.id)
+            )
+        else:
+            role_map = {
+                "employee": ["employee"],
+                "executor": ["executor"],
+            }
+            role_codes = role_map.get(role_key, [role_key])
+            rows = await session.execute(
+                select(User.id, User.full_name, User.is_active)
+                .join(user_roles, user_roles.c.user_id == User.id)
+                .join(Role, Role.id == user_roles.c.role_id)
+                .where(Role.code.in_(role_codes))
+                .order_by(User.full_name)
+            )
         users = {}
         for user_id, full_name, is_active in rows.all():
             if user_id not in users:
@@ -300,7 +309,13 @@ async def user_add_full_name(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(full_name=full_name)
     async with SessionLocal() as session:
-        roles = (await session.execute(select(Role.id, Role.name).order_by(Role.name))).all()
+        roles = (
+            await session.execute(
+                select(Role.id, Role.name)
+                .where(Role.code != "chief_approver")
+                .order_by(Role.name)
+            )
+        ).all()
     await state.set_state(AdminAddUser.role)
     await message.answer("Выберите роль", reply_markup=roles_keyboard(roles))
 

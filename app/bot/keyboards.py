@@ -8,8 +8,9 @@ def main_menu_keyboard(role_codes) -> ReplyKeyboardMarkup:
     builder.button(text="📝 Создать заявку")
     builder.button(text="📥 Скачать шаблон заявки")
     builder.button(text="📚 Архив")
-    if "executor" in codes:
+    if codes:
         builder.button(text="📌 Мои заявки")
+    if "executor" in codes:
         builder.button(text="📤 Выгрузить ежедневные заявки")
         builder.button(text="📊 Выгрузить статистику сотрудников")
         builder.button(text="📅 Срок поставки")

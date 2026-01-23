@@ -14,7 +14,6 @@ from app.db.models import (
 ROLE_DATA = [
     {"code": "employee", "name": "Сотрудник"},
     {"code": "approver", "name": "Согласующий"},
-    {"code": "chief_approver", "name": "Главный согласующий"},
     {"code": "executor", "name": "Исполнитель"},
     {"code": "admin", "name": "Администратор"},
 ]
@@ -74,7 +73,11 @@ DEFAULT_USERS = [
         "is_default_approver": True,
     },
     {"full_name": "Ковалев Д.А.", "role_code": "approver"},
-    {"full_name": "Голубцова Анастасия Александровна", "role_code": "chief_approver"},
+    {
+        "full_name": "Голубцова Анастасия Александровна",
+        "role_code": "approver",
+        "is_default_approver": True,
+    },
     {"full_name": "Губайдуллин Рамиль Рашитович", "role_code": "executor"},
     {"full_name": "Азизова Амира Фаридовна", "role_code": "executor"},
     {"full_name": "Шаймарданова Алина Рашидовна", "role_code": "executor"},

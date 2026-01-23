@@ -6,7 +6,7 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, FSInputFile
-from sqlalchemy import select, func
+from sqlalchemy import or_, select, func
 from sqlalchemy.orm import selectinload
 
 from app.bot.keyboards import (
@@ -131,9 +131,9 @@ async def _get_or_create_reference(session, model, name: str | None, cache: dict
 async def _fetch_approvers(session) -> list[tuple[int, str]]:
     rows = await session.execute(
         select(User.id, User.full_name)
-        .join(user_roles, user_roles.c.user_id == User.id)
-        .join(Role, Role.id == user_roles.c.role_id)
-        .where(Role.code.in_(["approver", "chief_approver"]))
+        .outerjoin(user_roles, user_roles.c.user_id == User.id)
+        .outerjoin(Role, Role.id == user_roles.c.role_id)
+        .where(or_(Role.code == "approver", User.is_default_approver.is_(True)))
         .distinct()
         .order_by(User.full_name, User.id)
     )
@@ -850,18 +850,6 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
         selected = await session.get(User, selected_id)
         _add_approver(selected)
 
-        chiefs = (
-            await session.execute(
-                select(User)
-                .join(user_roles, user_roles.c.user_id == User.id)
-                .join(Role, Role.id == user_roles.c.role_id)
-                .where(Role.code == "chief_approver")
-                .order_by(User.full_name)
-            )
-        ).scalars().all()
-        for chief in chiefs:
-            _add_approver(chief)
-
         approvals = []
         for user in ordered_approvers:
             approval = Approval(
@@ -946,15 +934,25 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
                     override_user if override_user and override_user.tg_id else approver
                 )
                 if target_user.tg_id:
-                    await _send_request_with_attachments(
-                        callback.bot, request, target_user, items, attachments
-                    )
-                    await send_to_user(
-                        callback.bot,
-                        target_user,
-                        "Примите решение по заявке:",
-                        reply_markup=approval_action_keyboard(approval.id),
-                    )
+                    if approver.is_default_approver:
+                        await send_to_user(
+                            callback.bot,
+                            target_user,
+                            (
+                                f"📌 Заявка №{request.id} требует согласования, "
+                                "проверьте \"Мои заявки\"."
+                            ),
+                        )
+                    else:
+                        await _send_request_with_attachments(
+                            callback.bot, request, target_user, items, attachments
+                        )
+                        await send_to_user(
+                            callback.bot,
+                            target_user,
+                            "Примите решение по заявке:",
+                            reply_markup=approval_action_keyboard(approval.id),
+                        )
 
     excel_groups = data.get("excel_groups")
     if excel_groups:

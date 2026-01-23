@@ -603,7 +603,7 @@ async def assign_executor(callback: CallbackQuery) -> None:
     executor_id = int(exec_id)
     async with SessionLocal() as session:
         current_user = await _get_user(session, callback.from_user)
-        if not await user_has_role(session, current_user.id, "chief_approver") and not await _is_override_user(
+        if not current_user.is_default_approver and not await _is_override_user(
             callback.from_user
         ):
             await callback.answer("Нет доступа")
@@ -1171,20 +1171,6 @@ async def my_attach(callback: CallbackQuery) -> None:
         attachments,
     )
     await callback.answer()
-
-
-@router.message(F.text == "📌 Мои заявки")
-async def my_requests(message: Message, state: FSMContext) -> None:
-    async with SessionLocal() as session:
-        username = await ensure_username_format(message.from_user.username)
-        user = await get_or_create_user(
-            session, message.from_user.id, username, message.from_user.full_name
-        )
-        if not await _is_executor(session, user.id):
-            await message.answer("Доступно только исполнителям.")
-            return
-    await state.clear()
-    await _show_my_list(message, user.id, page=1, edit=False)
 
 
 @router.message(

@@ -6,18 +6,13 @@ from app.db.models import Role, User, user_roles
 async def get_or_create_user(session, tg_id: int, username: str | None, full_name: str | None) -> User:
     user = await session.scalar(select(User).where(User.tg_id == tg_id))
     if user:
-        if username and user.tg_username != username:
-            user.tg_username = username
-        if full_name and user.full_name != full_name:
-            user.full_name = full_name
         return user
 
     if username:
         user = await session.scalar(select(User).where(User.tg_username == username))
         if user:
-            user.tg_id = tg_id
-            if full_name and user.full_name != full_name:
-                user.full_name = full_name
+            if not user.tg_id:
+                user.tg_id = tg_id
             return user
 
     user = User(
