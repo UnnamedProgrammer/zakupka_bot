@@ -4,21 +4,16 @@ from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message, FSInputFile
-from sqlalchemy import or_, select, func
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
-from app.bot.keyboards import (
-    approval_action_keyboard,
-    approver_keyboard,
-    add_item_keyboard,
-    attachments_done_keyboard,
-    cfo_keyboard,
-    departments_keyboard,
-    request_method_keyboard,
-)
-from app.bot.states import RequestCreate
+from app.bot.keyboards import approval_action_keyboard
+from app.bot.states import RequestCreate, TemplateDownload
+from app.config import settings
 from app.db.models import (
     Approval,
     ApprovalStatus,
@@ -36,18 +31,32 @@ from app.db.models import (
     user_roles,
 )
 from app.db.session import SessionLocal
-from app.services.constants import APPROVAL_STATUS_PENDING, REQUEST_STATUS_PENDING
-from app.config import settings
 from app.services.attachments import build_photo_groups_from, fetch_request_media
-from app.services.excel import TemplateParseError, build_request_xlsx, parse_request_template
-from app.services.files import save_telegram_file, save_bytes_file
+from app.services.constants import APPROVAL_STATUS_PENDING, REQUEST_STATUS_PENDING
+from app.services.excel import (
+    TemplateParseError,
+    build_request_template_prefilled_xlsx,
+    build_request_xlsx,
+    parse_request_template,
+)
+from app.services.files import save_bytes_file, save_telegram_file
 from app.services.formatters import format_request_summary
 from app.services.notifications import send_to_user
 from app.services.users import ensure_username_format, get_or_create_user
+from app.bot.handlers.common import cleanup_main_menu
 
 router = Router()
 logger = logging.getLogger(__name__)
 _album_buffers: dict[tuple[int, str], dict] = {}
+_TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "templates" / "request_template.xlsx"
+TEMPLATE_PAGE_SIZE = 6
+
+
+async def _try_delete_message(message: Message) -> None:
+    try:
+        await message.delete()
+    except (TelegramForbiddenError, TelegramBadRequest):
+        return
 
 
 def _is_image_document(message: Message) -> bool:
@@ -60,10 +69,20 @@ def _is_image_document(message: Message) -> bool:
 async def _queue_album_attachment(message: Message, state: FSMContext, file_info: dict) -> None:
     if not message.media_group_id:
         return
+    data = await state.get_data()
+    item_index = data.get("current_item_index")
+    if item_index is None:
+        return
     key = (message.chat.id, message.media_group_id)
     buffer = _album_buffers.get(key)
     if not buffer:
-        buffer = {"photos": [], "chat_id": message.chat.id, "bot": message.bot, "task": None}
+        buffer = {
+            "photos": [],
+            "chat_id": message.chat.id,
+            "bot": message.bot,
+            "task": None,
+            "item_index": item_index,
+        }
         _album_buffers[key] = buffer
     buffer["photos"].append(file_info)
     if buffer["task"] is None:
@@ -76,8 +95,12 @@ async def _flush_album(key: tuple[int, str], state: FSMContext) -> None:
     if not buffer:
         return
     data = await state.get_data()
-    current_item = data.get("current_item") or {}
-    attachments = current_item.get("attachments") or []
+    items = data.get("items") or []
+    item_index = buffer.get("item_index")
+    if item_index is None or item_index >= len(items):
+        return
+    item = items[item_index]
+    attachments = item.get("attachments") or []
     current_photos = sum(1 for att in attachments if att.get("file_type") == "photo")
     allowed = max(0, 3 - current_photos)
     if allowed <= 0:
@@ -88,8 +111,9 @@ async def _flush_album(key: tuple[int, str], state: FSMContext) -> None:
     photos = buffer["photos"]
     to_add = photos[:allowed]
     attachments.extend(to_add)
-    current_item["attachments"] = attachments
-    await state.update_data(current_item=current_item)
+    item["attachments"] = attachments
+    items[item_index] = item
+    await state.update_data(items=items)
     if len(photos) > allowed:
         await buffer["bot"].send_message(
             buffer["chat_id"],
@@ -110,7 +134,81 @@ def _normalize_key(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
-async def _get_or_create_reference(session, model, name: str | None, cache: dict[str, int]) -> int | None:
+def _normalize_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip()
+    return " ".join(text.split())
+
+
+def _paginate(items: list, page: int, page_size: int) -> tuple[list, int, int]:
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    return items[start : start + page_size], page, total_pages
+
+
+def _truncate_text(text: str, max_len: int = 48) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
+def _display_value(value: str | None, default: str = "не выбрано") -> str:
+    text = _normalize_text(value)
+    if not text:
+        return default
+    return _truncate_text(text, 60)
+
+
+def _item_label(item: dict, index: int) -> str:
+    name = _normalize_text(item.get("name")) or "без названия"
+    qty = _normalize_text(item.get("qty"))
+    unit = _normalize_text(item.get("unit"))
+    qty_unit = " ".join(part for part in [qty, unit] if part)
+    suffix = f" ({qty_unit})" if qty_unit else ""
+    label = f"{index + 1}. {name}{suffix}"
+    return _truncate_text(label, 60)
+
+
+def _items_overview(items: list[dict]) -> str:
+    if not items:
+        return "нет"
+    lines = [f"- {_item_label(item, idx)}" for idx, item in enumerate(items)]
+    return "\n".join(lines)
+
+
+def _count_links(text: str | None) -> int:
+    if not text:
+        return 0
+    return sum(1 for line in text.splitlines() if line.strip())
+
+
+def _is_item_empty(item: dict) -> bool:
+    if _normalize_text(item.get("name")):
+        return False
+    if _normalize_text(item.get("specs")):
+        return False
+    if _normalize_text(item.get("brand")):
+        return False
+    if _normalize_text(item.get("qty")):
+        return False
+    if _normalize_text(item.get("unit")):
+        return False
+    if _normalize_text(item.get("link")):
+        return False
+    if _normalize_text(item.get("note")):
+        return False
+    attachments = item.get("attachments") or []
+    return len(attachments) == 0
+
+
+async def _get_or_create_reference(
+    session, model, name: str | None, cache: dict[str, int]
+) -> int | None:
     if not name:
         return None
     normalized_name = " ".join(name.split())
@@ -250,491 +348,556 @@ async def _get_next_pending_approval(session, request_id: int):
     return rows.first()
 
 
-@router.message(F.text == "📝 Создать заявку")
-async def create_request_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await state.set_state(RequestCreate.method)
-    await message.answer(
-        "Как будете создавать заявку?", reply_markup=request_method_keyboard()
-    )
+def _request_menu_text(data: dict, error: str | None = None) -> str:
+    method = data.get("request_method")
+    method_label = {"manual": "вручную", "excel": "excel"}.get(method, "не выбран")
+    initiator = data.get("initiator_name") or data.get("initiator_tg_name")
+    lines = [
+        "📝 Создание заявки",
+        f"Способ: {method_label}",
+        f"Инициатор: {_display_value(initiator, default='не указан')}",
+    ]
 
-
-@router.callback_query(RequestCreate.method, F.data.startswith("req_method:"))
-async def create_request_method(callback: CallbackQuery, state: FSMContext) -> None:
-    method = callback.data.split(":")[1]
-    try:
-        await callback.answer()
-    except TelegramBadRequest:
-        pass
     if method == "manual":
-        await state.update_data(full_name=callback.from_user.full_name.strip())
-        await _prompt_departments(callback.message, state)
+        lines.extend(
+            [
+                f"Подразделение: {_display_value(data.get('department_name'))}",
+                f"ЦФО: {_display_value(data.get('cfo_name'))}",
+                f"МОЛ: {_display_value(data.get('mol_full_name'), default='не указан')}",
+                (
+                    "Макс. цена договора (тыс.руб.): "
+                    f"{_display_value(data.get('contract_max_price'))}"
+                ),
+                (
+                    "БДДС (Статья - Категория): "
+                    f"{_display_value(data.get('bdds_article_category'))}"
+                ),
+                "Товары:",
+                _items_overview(data.get("items") or []),
+                f"Согласующий: {_display_value(data.get('approver_name'), default='не выбран')}",
+            ]
+        )
+        lines.append("")
+        lines.append("Заполните поля и нажмите «Отправить».")
+    elif method == "excel":
+        file_name = data.get("excel_file_name")
+        if file_name:
+            lines.append(f"Файл: {file_name}")
+        else:
+            lines.append("Файл: не загружен")
+        lines.append("Отправьте Excel файл по шаблону.")
     else:
-        await state.set_state(RequestCreate.excel_file)
-        await callback.message.answer("Загрузите Excel файл по шаблону.")
+        lines.append("Выберите способ создания заявки.")
+
+    if error:
+        lines.append("")
+        lines.append(f"⚠️ {error}")
+    return "\n".join(lines)
 
 
-@router.message(RequestCreate.excel_file)
-async def create_request_excel_file(message: Message, state: FSMContext) -> None:
-    if not message.document:
-        await message.answer("Пожалуйста, отправьте Excel файл (.xlsx).")
-        return
-    file_name = message.document.file_name or ""
-    if Path(file_name).suffix.lower() != ".xlsx":
-        await message.answer("Нужен файл формата .xlsx. Проверьте и отправьте заново.")
-        return
+def _request_menu_keyboard(data: dict):
+    method = data.get("request_method")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✍️ Вручную", callback_data="req_method:manual")
+    builder.button(text="📄 Excel", callback_data="req_method:excel")
 
-    file_path = await save_telegram_file(
-        message.bot,
-        message.document.file_id,
-        dest_dir=settings.files_dir,
-        filename_hint=file_name,
+    if method == "manual":
+        builder.button(text="🏢 Подразделение", callback_data="req_field:department")
+        builder.button(text="🏷️ ЦФО", callback_data="req_field:cfo")
+        builder.button(text="👔 МОЛ", callback_data="req_field:mol")
+        builder.button(text="💰 Макс. цена", callback_data="req_field:contract_max_price")
+        builder.button(text="📑 БДДС", callback_data="req_field:bdds_article_category")
+        builder.button(text="🧾 Товары", callback_data="req_items:menu")
+        builder.button(text="✅ Согласующий", callback_data="req_field:approver")
+        builder.button(text="🚀 Отправить", callback_data="req_submit")
+        builder.button(text="❌ Отмена", callback_data="req_cancel")
+        builder.adjust(2, 2, 2, 2, 1, 2)
+    elif method == "excel":
+        builder.button(text="📄 Загрузить файл", callback_data="req_excel:upload")
+        builder.button(text="❌ Отмена", callback_data="req_cancel")
+        builder.adjust(2, 1)
+    else:
+        builder.button(text="❌ Отмена", callback_data="req_cancel")
+        builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def _departments_keyboard(items: list[tuple[int, str]]):
+    builder = InlineKeyboardBuilder()
+    for dep_id, name in items:
+        builder.button(text=f"🏢 {name}", callback_data=f"req_department:{dep_id}")
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="req_menu"))
+    return builder.as_markup()
+
+
+def _cfo_keyboard(items: list[tuple[int, str]]):
+    builder = InlineKeyboardBuilder()
+    for cfo_id, name in items:
+        builder.button(text=f"🏷️ {name}", callback_data=f"req_cfo:{cfo_id}")
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="req_menu"))
+    return builder.as_markup()
+
+
+def _approver_keyboard(items: list[tuple[int, str]], back_callback: str = "req_menu"):
+    builder = InlineKeyboardBuilder()
+    for user_id, name in items:
+        builder.button(text=f"👤 {name}", callback_data=f"req_approver:{user_id}")
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback))
+    return builder.as_markup()
+
+
+def _items_menu_keyboard(items: list[dict]):
+    builder = InlineKeyboardBuilder()
+    for idx, item in enumerate(items):
+        builder.button(text=_item_label(item, idx), callback_data=f"req_item_edit:{idx}")
+    builder.button(text="➕ Добавить товар", callback_data="req_item_add")
+    builder.button(text="⬅️ Назад", callback_data="req_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _item_editor_keyboard(item_index: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Наименование", callback_data=f"req_item_field:{item_index}:name")
+    builder.button(text="Характеристики", callback_data=f"req_item_field:{item_index}:specs")
+    builder.button(text="Марка/аналог", callback_data=f"req_item_field:{item_index}:brand")
+    builder.button(text="Количество", callback_data=f"req_item_field:{item_index}:qty")
+    builder.button(text="Ед. измерения", callback_data=f"req_item_field:{item_index}:unit")
+    builder.button(text="Ссылка", callback_data=f"req_item_field:{item_index}:link")
+    builder.button(text="Примечание", callback_data=f"req_item_field:{item_index}:note")
+    builder.button(text="Вложения", callback_data=f"req_item_attachments:{item_index}")
+    builder.button(text="🗑️ Удалить товар", callback_data=f"req_item_delete:{item_index}")
+    builder.button(text="⬅️ К списку", callback_data="req_items:menu")
+    builder.adjust(2, 2, 2, 2, 1, 1)
+    return builder.as_markup()
+
+
+def _input_prompt_keyboard(clear_callback: str, back_callback: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🧹 Очистить", callback_data=clear_callback)
+    builder.button(text="⬅️ Назад", callback_data=back_callback)
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def _attachments_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Готово", callback_data="req_item_attach_done")
+    builder.button(text="🧹 Очистить", callback_data="req_item_attach_clear")
+    builder.button(text="⬅️ Назад", callback_data="req_item_attach_back")
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def _template_departments_keyboard(
+    items: list[tuple[int, str]], page: int, total_pages: int
+):
+    builder = InlineKeyboardBuilder()
+    for dep_id, name in items:
+        builder.button(text=_truncate_text(name, 60), callback_data=f"tmpl_dep_pick:{dep_id}:{page}")
+    if items:
+        builder.adjust(1)
+
+    nav_buttons = []
+    if total_pages > 1:
+        if page > 1:
+            nav_buttons.append(
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=f"tmpl_dep_list:{page - 1}")
+            )
+        if page < total_pages:
+            nav_buttons.append(
+                InlineKeyboardButton(text="➡️ Далее", callback_data=f"tmpl_dep_list:{page + 1}")
+            )
+    if nav_buttons:
+        builder.row(*nav_buttons)
+
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="tmpl_cancel"))
+    return builder.as_markup()
+
+
+def _template_cfo_keyboard(
+    items: list[tuple[int, str]], page: int, total_pages: int
+):
+    builder = InlineKeyboardBuilder()
+    for cfo_id, name in items:
+        builder.button(text=_truncate_text(name, 60), callback_data=f"tmpl_cfo_pick:{cfo_id}:{page}")
+    if items:
+        builder.adjust(1)
+
+    nav_buttons = []
+    if total_pages > 1:
+        if page > 1:
+            nav_buttons.append(
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=f"tmpl_cfo_list:{page - 1}")
+            )
+        if page < total_pages:
+            nav_buttons.append(
+                InlineKeyboardButton(text="➡️ Далее", callback_data=f"tmpl_cfo_list:{page + 1}")
+            )
+    if nav_buttons:
+        builder.row(*nav_buttons)
+
+    builder.row(InlineKeyboardButton(text="⬅️ К подразделениям", callback_data="tmpl_dep_back"))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="tmpl_cancel"))
+    return builder.as_markup()
+
+
+def _items_menu_text(items: list[dict]) -> str:
+    if not items:
+        return "Товары не добавлены."
+    lines = ["Список товаров:"]
+    lines.extend([f"- {_item_label(item, idx)}" for idx, item in enumerate(items)])
+    return "\n".join(lines)
+
+
+def _item_editor_text(item: dict, index: int) -> str:
+    attachments = item.get("attachments") or []
+    links_count = _count_links(item.get("link"))
+    return "\n".join(
+        [
+            f"Товар {index + 1}",
+            f"Наименование: {_display_value(item.get('name'), default='не указано')}",
+            f"Характеристики: {_display_value(item.get('specs'), default='не указаны')}",
+            f"Марка/аналог: {_display_value(item.get('brand'), default='не указана')}",
+            f"Количество: {_display_value(item.get('qty'), default='не указано')}",
+            f"Ед. измерения: {_display_value(item.get('unit'), default='не указана')}",
+            f"Ссылки: {links_count}",
+            f"Вложения: {len(attachments)}",
+            f"Примечание: {_display_value(item.get('note'), default='не указано')}",
+        ]
     )
-    try:
-        parsed = parse_request_template(file_path)
-    except TemplateParseError as exc:
-        await message.answer(str(exc))
-        await state.clear()
+
+
+async def _edit_request_message(
+    bot,
+    state: FSMContext,
+    text: str,
+    reply_markup=None,
+    fallback_message: Message | None = None,
+) -> None:
+    data = await state.get_data()
+    chat_id = data.get("req_chat_id")
+    message_id = data.get("req_message_id")
+    if chat_id and message_id:
         try:
-            Path(file_path).unlink()
-        except FileNotFoundError:
-            pass
-        return
-    except Exception:
-        logger.exception("Failed to parse request template")
-        await message.answer("Не удалось прочитать Excel файл. Проверьте шаблон и загрузите заново.")
-        await state.clear()
-        try:
-            Path(file_path).unlink()
-        except FileNotFoundError:
-            pass
-        return
-
-    async with SessionLocal() as session:
-        initiator_rows = (
-            await session.execute(
-                select(User).where(User.full_name == parsed["initiator_name"])
+            await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=reply_markup,
             )
-        ).scalars().all()
-        if not initiator_rows:
-            await message.answer(
-                "Инициатор из ячейки G2 не найден в базе пользователей. "
-                "Исправьте ФИО и загрузите файл заново."
-            )
-            await state.clear()
-            try:
-                Path(file_path).unlink()
-            except FileNotFoundError:
-                pass
             return
-        if len(initiator_rows) > 1:
-            await message.answer(
-                "Найдено несколько пользователей с таким ФИО инициатора. "
-                "Уточните ФИО в базе и загрузите файл заново."
-            )
-            await state.clear()
-            try:
-                Path(file_path).unlink()
-            except FileNotFoundError:
-                pass
-            return
-        initiator = initiator_rows[0]
-
-        dep_rows = await session.execute(select(Department.id, Department.name))
-        department_map = {
-            _normalize_key(name): (dep_id, name) for dep_id, name in dep_rows.all()
-        }
-        cfo_rows = await session.execute(select(Cfo.id, Cfo.name))
-        cfo_map = {
-            _normalize_key(name): (cfo_id, name) for cfo_id, name in cfo_rows.all()
-        }
-        if not cfo_map:
-            await message.answer("В базе нет ЦФО. Загрузка заявки невозможна.")
-            await state.clear()
-            try:
-                Path(file_path).unlink()
-            except FileNotFoundError:
-                pass
-            return
-
-        excel_groups = []
-        for group in parsed["groups"]:
-            dept_key = _normalize_key(group["department_name"])
-            dept = department_map.get(dept_key)
-            if not dept:
-                await message.answer(
-                    f"Подразделение «{group['department_name']}» не найдено в базе. "
-                    "Исправьте файл и загрузите заново."
-                )
-                await state.clear()
-                try:
-                    Path(file_path).unlink()
-                except FileNotFoundError:
-                    pass
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
                 return
-            cfo_key = _normalize_key(group["cfo_name"])
-            cfo = cfo_map.get(cfo_key)
-            if not cfo:
-                await message.answer(
-                    f"ЦФО «{group['cfo_name']}» не найдено в базе. "
-                    "Исправьте файл и загрузите заново."
-                )
-                await state.clear()
-                try:
-                    Path(file_path).unlink()
-                except FileNotFoundError:
-                    pass
-                return
-            excel_groups.append(
-                {
-                    "department_id": dept[0],
-                    "department_name": dept[1],
-                    "cfo_id": cfo[0],
-                    "mol_full_name": group["mol_full_name"],
-                    "items": group["items"],
-                }
-            )
-
-    if not excel_groups:
-        await message.answer("В файле нет данных для создания заявки.")
-        await state.clear()
-        try:
-            Path(file_path).unlink()
-        except FileNotFoundError:
-            pass
+    if fallback_message:
+        new_message = await fallback_message.answer(text, reply_markup=reply_markup)
+    elif chat_id:
+        new_message = await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    else:
         return
-
     await state.update_data(
-        initiator_id=initiator.id,
-        full_name=initiator.full_name,
-        description_method="excel",
-        excel_file_path=file_path,
-        excel_file_name=file_name,
-        excel_groups=excel_groups,
-        excel_group_index=0,
+        req_message_id=new_message.message_id,
+        req_chat_id=new_message.chat.id,
     )
-    await _prompt_excel_approver(message, state)
 
 
-@router.message(RequestCreate.full_name)
-async def create_request_full_name(message: Message, state: FSMContext) -> None:
-    await state.update_data(full_name=message.text.strip())
-    await _prompt_departments(message, state)
+async def _delete_tracked_message(
+    bot,
+    state: FSMContext,
+    message_key: str,
+    chat_key: str,
+    fallback_message: Message | None = None,
+) -> None:
+    data = await state.get_data()
+    chat_id = data.get(chat_key)
+    message_id = data.get(message_key)
+    if chat_id and message_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+    elif fallback_message:
+        try:
+            await fallback_message.delete()
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+    await state.update_data({message_key: None, chat_key: None})
 
 
-async def _prompt_departments(message: Message, state: FSMContext) -> None:
+async def _show_request_menu(
+    bot,
+    state: FSMContext,
+    error: str | None = None,
+    fallback_message: Message | None = None,
+) -> None:
+    data = await state.get_data()
+    await _edit_request_message(
+        bot,
+        state,
+        _request_menu_text(data, error=error),
+        _request_menu_keyboard(data),
+        fallback_message=fallback_message,
+    )
+
+
+async def _edit_template_message(
+    bot,
+    state: FSMContext,
+    text: str,
+    reply_markup=None,
+    fallback_message: Message | None = None,
+) -> None:
+    data = await state.get_data()
+    chat_id = data.get("tmpl_chat_id")
+    message_id = data.get("tmpl_message_id")
+    if chat_id and message_id:
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=reply_markup,
+            )
+            return
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+    if fallback_message:
+        new_message = await fallback_message.answer(text, reply_markup=reply_markup)
+    elif chat_id:
+        new_message = await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    else:
+        return
+    await state.update_data(
+        tmpl_message_id=new_message.message_id,
+        tmpl_chat_id=new_message.chat.id,
+    )
+
+
+async def _show_template_departments(
+    bot, state: FSMContext, page: int, fallback_message: Message | None = None
+) -> None:
     async with SessionLocal() as session:
-        dep_rows = await session.execute(
+        rows = await session.execute(
             select(Department.id, Department.name).order_by(Department.name)
         )
-        deps = dep_rows.all()
-    await state.set_state(RequestCreate.department)
-    await message.answer("Выберите подразделение", reply_markup=departments_keyboard(deps))
+        items = rows.all()
+    items_page, page, total_pages = _paginate(items, page, TEMPLATE_PAGE_SIZE)
+    text = "Выберите подразделение."
+    if items:
+        text += f" Страница {page}/{total_pages}."
+    else:
+        text += " Подразделения не найдены."
+    await _edit_template_message(
+        bot,
+        state,
+        text,
+        _template_departments_keyboard(items_page, page, total_pages),
+        fallback_message=fallback_message,
+    )
 
 
-@router.callback_query(RequestCreate.department, F.data.startswith("dept:"))
-async def create_request_department(callback: CallbackQuery, state: FSMContext) -> None:
-    dep_id = int(callback.data.split(":")[1])
-    await state.update_data(department_id=dep_id)
+async def _show_template_cfos(
+    bot, state: FSMContext, page: int, fallback_message: Message | None = None
+) -> None:
     async with SessionLocal() as session:
         rows = await session.execute(select(Cfo.id, Cfo.name).order_by(Cfo.name))
-        cfos = rows.all()
-    await state.set_state(RequestCreate.cfo)
-    await callback.message.answer("Выберите ЦФО", reply_markup=cfo_keyboard(cfos))
-    await callback.answer()
-
-
-@router.callback_query(RequestCreate.cfo, F.data.startswith("cfo:"))
-async def create_request_cfo(callback: CallbackQuery, state: FSMContext) -> None:
-    cfo_id = int(callback.data.split(":")[1])
-    await state.update_data(cfo_id=cfo_id, description_method="manual", items=[])
-    await state.set_state(RequestCreate.item_name)
-    await callback.message.answer("Наименование")
-    await callback.answer()
-
-
-@router.callback_query(RequestCreate.description_method, F.data.startswith("desc:"))
-async def create_request_description_method(callback: CallbackQuery, state: FSMContext) -> None:
-    method = callback.data.split(":")[1]
-    await state.update_data(description_method=method)
-    if method == "excel":
-        await callback.message.answer(
-            "Для загрузки Excel выберите этот вариант в начале создания заявки."
-        )
-        await state.clear()
-        await callback.answer()
-        return
-    await state.update_data(items=[])
-    await state.set_state(RequestCreate.item_name)
-    await callback.message.answer("Наименование")
-    await callback.answer()
-
-
-@router.message(RequestCreate.item_name)
-async def create_request_item_name(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    items = data.get("items") or []
-    await state.update_data(
-        items=items, current_item={"name": message.text.strip(), "attachments": []}
-    )
-    await state.set_state(RequestCreate.item_specs)
-    await message.answer("Технические характеристики")
-
-
-@router.message(RequestCreate.item_specs)
-async def create_request_item_specs(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    current = data.get("current_item") or {}
-    current["specs"] = message.text.strip()
-    await state.update_data(current_item=current)
-    await state.set_state(RequestCreate.item_brand)
-    await message.answer("Марка устройства или указание аналога")
-
-
-@router.message(RequestCreate.item_brand)
-async def create_request_item_brand(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    current = data.get("current_item") or {}
-    current["brand"] = message.text.strip()
-    await state.update_data(current_item=current)
-    await state.set_state(RequestCreate.item_qty)
-    await message.answer("Количество")
-
-
-@router.message(RequestCreate.item_qty)
-async def create_request_item_qty(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    current = data.get("current_item") or {}
-    current["qty"] = message.text.strip()
-    await state.update_data(current_item=current)
-    await state.set_state(RequestCreate.item_unit)
-    await message.answer("Единица измерения количества")
-
-
-@router.message(RequestCreate.item_unit)
-async def create_request_item_unit(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    current = data.get("current_item") or {}
-    current["unit"] = message.text.strip()
-    current.setdefault("attachments", [])
-    await state.update_data(current_item=current)
-    await state.set_state(RequestCreate.item_link_or_photo)
-    await message.answer(
-        "Отправьте фото, файл или ссылку на товар (если нужно) и нажмите «Готово».",
-        reply_markup=attachments_done_keyboard(),
-    )
-
-
-@router.message(RequestCreate.item_link_or_photo)
-async def create_request_item_link_or_photo(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    current_item = data.get("current_item") or {}
-    attachments = current_item.get("attachments") or []
-    if message.photo:
-        if message.media_group_id:
-            photo = message.photo[-1]
-            await _queue_album_attachment(
-                message,
-                state,
-                {
-                    "file_id": photo.file_id,
-                    "file_unique_id": photo.file_unique_id,
-                    "file_type": "photo",
-                    "file_name": None,
-                },
-            )
-            return
-        photo_count = sum(1 for att in attachments if att.get("file_type") == "photo")
-        if photo_count >= 3:
-            await message.answer("Можно добавить не более 3 фото для товара.")
-            return
-        photo = message.photo[-1]
-        attachments.append(
-            {
-                "file_id": photo.file_id,
-                "file_unique_id": photo.file_unique_id,
-                "file_type": "photo",
-                "file_name": None,
-            }
-        )
-        current_item["attachments"] = attachments
-        await state.update_data(current_item=current_item)
-        await message.answer("Фото добавлено. Можно отправить еще или нажмите «Готово».")
-        return
-    if message.document:
-        if _is_image_document(message):
-            if message.media_group_id:
-                doc = message.document
-                await _queue_album_attachment(
-                    message,
-                    state,
-                    {
-                        "file_id": doc.file_id,
-                        "file_unique_id": doc.file_unique_id,
-                        "file_type": "photo",
-                        "file_name": doc.file_name,
-                    },
-                )
-                return
-            photo_count = sum(1 for att in attachments if att.get("file_type") == "photo")
-            if photo_count >= 3:
-                await message.answer("Можно добавить не более 3 фото для товара.")
-                return
-            doc = message.document
-            attachments.append(
-                {
-                    "file_id": doc.file_id,
-                    "file_unique_id": doc.file_unique_id,
-                    "file_type": "photo",
-                    "file_name": doc.file_name,
-                }
-            )
-            current_item["attachments"] = attachments
-            await state.update_data(current_item=current_item)
-            await message.answer("Фото добавлено. Можно отправить еще или нажмите «Готово».")
-            return
-        doc = message.document
-        attachments.append(
-            {
-                "file_id": doc.file_id,
-                "file_unique_id": doc.file_unique_id,
-                "file_type": "document",
-                "file_name": doc.file_name,
-            }
-        )
-        current_item["attachments"] = attachments
-        await state.update_data(current_item=current_item)
-        await message.answer("Файл добавлен. Можно отправить еще или нажмите «Готово».")
-        return
-    if message.text:
-        current = current_item.get("link", "")
-        if current:
-            current = f"{current}\n{message.text.strip()}"
-        else:
-            current = message.text.strip()
-        current_item["link"] = current
-        await state.update_data(current_item=current_item)
-        await message.answer("Ссылка сохранена. Можно отправить еще или нажмите «Готово».")
-        return
-    await message.answer("Отправьте фото, файл или ссылку, либо нажмите «Готово».")
-
-
-@router.callback_query(RequestCreate.item_link_or_photo, F.data == "attachments:done")
-async def create_request_attachments_done(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(RequestCreate.item_note)
-    await callback.message.answer("Примечание (при необходимости)")
-    await callback.answer()
-
-
-@router.callback_query(RequestCreate.item_link_or_photo, F.data == "attachments:skip")
-async def create_request_attachments_skip(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(RequestCreate.item_note)
-    await callback.message.answer("Примечание (при необходимости)")
-    await callback.answer()
-
-
-@router.message(RequestCreate.item_note)
-async def create_request_item_note(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    current_item = data.get("current_item") or {}
-    current_item["note"] = message.text.strip()
-    items = data.get("items") or []
-    items.append(current_item)
-    await state.update_data(items=items, current_item=None)
-    await state.set_state(RequestCreate.item_add_more)
-    await message.answer("Добавить еще товар?", reply_markup=add_item_keyboard())
-
-
-@router.callback_query(RequestCreate.item_add_more, F.data.startswith("item_more:"))
-async def create_request_item_more(callback: CallbackQuery, state: FSMContext) -> None:
-    choice = callback.data.split(":")[1]
-    if choice == "yes":
-        await state.set_state(RequestCreate.item_name)
-        await callback.message.answer("Наименование следующего товара")
+        items = rows.all()
+    items_page, page, total_pages = _paginate(items, page, TEMPLATE_PAGE_SIZE)
+    text = "Выберите ЦФО."
+    if items:
+        text += f" Страница {page}/{total_pages}."
     else:
-        await state.set_state(RequestCreate.mol_full_name)
-        await callback.message.answer("Введите ФИО материально ответственного лица (МОЛ)")
-    await callback.answer()
-
-
-@router.message(RequestCreate.mol_full_name)
-async def create_request_mol(message: Message, state: FSMContext) -> None:
-    await state.update_data(mol_full_name=message.text.strip())
-    async with SessionLocal() as session:
-        approvers = await _fetch_approvers(session)
-    await state.set_state(RequestCreate.approver_choice)
-    await message.answer(
-        "Выберите согласующего руководителя", reply_markup=approver_keyboard(approvers)
+        text += " ЦФО не найдены."
+    await _edit_template_message(
+        bot,
+        state,
+        text,
+        _template_cfo_keyboard(items_page, page, total_pages),
+        fallback_message=fallback_message,
     )
 
 
-async def _prompt_excel_approver(message: Message, state: FSMContext) -> None:
+async def _start_template_download(
+    bot,
+    state: FSMContext,
+    fallback_message: Message | None = None,
+    return_to_request: bool = False,
+) -> None:
     data = await state.get_data()
-    groups = data.get("excel_groups") or []
-    index = data.get("excel_group_index", 0)
-    if index >= len(groups):
-        await state.clear()
-        await message.answer("Загрузка заявок завершена.")
+    update_payload = {"tmpl_return": "request" if return_to_request else None}
+    if return_to_request:
+        update_payload["tmpl_message_id"] = data.get("req_message_id")
+        update_payload["tmpl_chat_id"] = data.get("req_chat_id")
+    await state.update_data(**update_payload)
+    await state.set_state(TemplateDownload.department)
+    await _show_template_departments(bot, state, page=1, fallback_message=fallback_message)
+
+
+async def _finish_template_download(
+    bot,
+    state: FSMContext,
+    fallback_message: Message | None = None,
+    cancelled: bool = False,
+) -> None:
+    data = await state.get_data()
+    return_to_request = data.get("tmpl_return") == "request"
+    await state.update_data(tmpl_return=None, tmpl_message_id=None, tmpl_chat_id=None)
+    if return_to_request:
+        await state.set_state(RequestCreate.menu)
+        await _show_request_menu(bot, state, fallback_message=fallback_message)
         return
-    group = groups[index]
-    await state.update_data(
-        department_id=group["department_id"],
-        cfo_id=group["cfo_id"],
-        items=group["items"],
-        mol_full_name=group["mol_full_name"],
-        description_method="excel",
-    )
-    async with SessionLocal() as session:
-        approvers = await _fetch_approvers(session)
-    await state.set_state(RequestCreate.approver_choice)
-    await message.answer(
-        f"Заявка из файла для подразделения «{group['department_name']}». "
-        "Выберите согласующего руководителя",
-        reply_markup=approver_keyboard(approvers),
-    )
+    await state.clear()
+    if cancelled:
+        await _delete_tracked_message(
+            bot,
+            state,
+            "tmpl_message_id",
+            "tmpl_chat_id",
+            fallback_message=fallback_message,
+        )
 
-
-@router.callback_query(RequestCreate.approver_choice, F.data.startswith("approver:"))
-async def create_request_approver(callback: CallbackQuery, state: FSMContext) -> None:
-    selected_id = int(callback.data.split(":")[1])
+async def _show_items_menu(
+    bot, state: FSMContext, fallback_message: Message | None = None
+) -> None:
     data = await state.get_data()
+    items = data.get("items") or []
+    await _edit_request_message(
+        bot,
+        state,
+        _items_menu_text(items),
+        _items_menu_keyboard(items),
+        fallback_message=fallback_message,
+    )
 
+
+async def _show_item_editor(
+    bot, state: FSMContext, item_index: int, fallback_message: Message | None = None
+) -> None:
+    data = await state.get_data()
+    items = data.get("items") or []
+    if item_index < 0 or item_index >= len(items):
+        await _show_items_menu(bot, state, fallback_message=fallback_message)
+        return
+    item = items[item_index]
+    await _edit_request_message(
+        bot,
+        state,
+        _item_editor_text(item, item_index),
+        _item_editor_keyboard(item_index),
+        fallback_message=fallback_message,
+    )
+
+
+async def _show_input_prompt(
+    bot,
+    state: FSMContext,
+    title: str,
+    clear_callback: str,
+    back_callback: str,
+    fallback_message: Message | None = None,
+) -> None:
+    await _edit_request_message(
+        bot,
+        state,
+        title,
+        _input_prompt_keyboard(clear_callback, back_callback),
+        fallback_message=fallback_message,
+    )
+
+
+async def _show_attachment_prompt(
+    bot, state: FSMContext, item_index: int, fallback_message: Message | None = None
+) -> None:
+    data = await state.get_data()
+    items = data.get("items") or []
+    if item_index < 0 or item_index >= len(items):
+        await _show_items_menu(bot, state, fallback_message=fallback_message)
+        return
+    item = items[item_index]
+    attachments = item.get("attachments") or []
+    links_count = _count_links(item.get("link"))
+    text = (
+        "Отправьте фото, файл или ссылку на товар.\n"
+        f"Ссылки: {links_count}\n"
+        f"Вложения: {len(attachments)}"
+    )
+    await _edit_request_message(
+        bot,
+        state,
+        text,
+        _attachments_keyboard(),
+        fallback_message=fallback_message,
+    )
+
+
+def _validate_manual_request(data: dict) -> list[str]:
+    errors: list[str] = []
+    if not data.get("department_id"):
+        errors.append("подразделение")
+    if not data.get("cfo_id"):
+        errors.append("ЦФО")
+    if not _normalize_text(data.get("mol_full_name")):
+        errors.append("МОЛ")
+    if not data.get("approver_id"):
+        errors.append("согласующий")
+    items = data.get("items") or []
+    if not items:
+        errors.append("хотя бы один товар")
+    else:
+        for idx, item in enumerate(items):
+            if not _normalize_text(item.get("name")):
+                errors.append(f"товар {idx + 1}: наименование")
+            if not _normalize_text(item.get("qty")):
+                errors.append(f"товар {idx + 1}: количество")
+            if not _normalize_text(item.get("unit")):
+                errors.append(f"товар {idx + 1}: единица измерения")
+    return errors
+
+
+async def _create_request(
+    bot,
+    data: dict,
+    selected_approver_id: int,
+    tg_user,
+    reply_message: Message,
+) -> Request | None:
     async with SessionLocal() as session:
         initiator_id = data.get("initiator_id")
-        is_excel = data.get("description_method") == "excel"
-        excel_file_path = data.get("excel_file_path")
-        excel_file_name = data.get("excel_file_name") or "request_template.xlsx"
-        if initiator_id:
-            initiator = await session.get(User, initiator_id)
-            if not initiator:
-                await callback.message.answer(
-                    "Инициатор из файла не найден. Загрузка заявки остановлена."
-                )
-                await state.clear()
-                await callback.answer()
-                return
-        else:
-            username = await ensure_username_format(callback.from_user.username)
+        initiator = await session.get(User, initiator_id) if initiator_id else None
+        if not initiator:
+            username = await ensure_username_format(tg_user.username)
             initiator = await get_or_create_user(
-                session, callback.from_user.id, username, data.get("full_name")
+                session, tg_user.id, username, data.get("initiator_name") or tg_user.full_name
             )
+        if not initiator:
+            await reply_message.answer("Не удалось определить инициатора заявки.")
+            return None
 
-        initiator.department_id = data.get("department_id")
+        department_id = data.get("department_id")
+        if department_id:
+            initiator.department_id = department_id
 
         status_id = await _get_status_id(session, RequestStatus, REQUEST_STATUS_PENDING)
         items = data.get("items") or []
         if not items:
-            await callback.message.answer("В заявке нет товаров. Проверьте данные.")
-            await state.clear()
-            await callback.answer()
-            return
+            await reply_message.answer("В заявке нет товаров. Проверьте данные.")
+            return None
         primary_item = items[0]
+
+        if not data.get("department_id") or not data.get("cfo_id"):
+            await reply_message.answer("Не заполнены подразделение или ЦФО.")
+            return None
 
         request = Request(
             status_id=status_id,
             initiator_id=initiator.id,
-            department_id=data["department_id"],
-            cfo_id=data["cfo_id"],
+            department_id=data.get("department_id"),
+            cfo_id=data.get("cfo_id"),
             description_method=data.get("description_method", "manual"),
             item_name=primary_item.get("name"),
             item_specs=primary_item.get("specs"),
@@ -744,15 +907,13 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
             item_link=primary_item.get("link"),
             item_note=primary_item.get("note"),
             mol_full_name=data.get("mol_full_name"),
+            contract_max_price=data.get("contract_max_price"),
+            bdds_article_category=data.get("bdds_article_category"),
         )
         session.add(request)
         await session.flush()
 
-        ref_cache = {
-            "omts": {},
-            "category": {},
-            "dds": {},
-        }
+        ref_cache = {"omts": {}, "category": {}, "dds": {}}
         for item in items:
             omts_id = await _get_or_create_reference(
                 session, OmtsResponsible, item.get("omts_responsible"), ref_cache["omts"]
@@ -786,7 +947,7 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
                         continue
                     photo_saved += 1
                 file_path = await save_telegram_file(
-                    callback.bot,
+                    bot,
                     item_att["file_id"],
                     dest_dir=settings.files_dir,
                     filename_hint=item_att.get("file_name"),
@@ -804,14 +965,12 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
                     )
                 )
 
-        if is_excel:
+        if data.get("description_method") == "excel":
+            excel_file_path = data.get("excel_file_path")
+            excel_file_name = data.get("excel_file_name") or "request_template.xlsx"
             if not excel_file_path:
-                await callback.message.answer(
-                    "Файл Excel не найден. Загрузка заявки остановлена."
-                )
-                await state.clear()
-                await callback.answer()
-                return
+                await reply_message.answer("Файл Excel не найден. Загрузка заявки остановлена.")
+                return None
             session.add(
                 Attachment(
                     request_id=request.id,
@@ -837,18 +996,22 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
             seen_ids.add(user.id)
             ordered_approvers.append(user)
 
-        extra_defaults = (
+        default_approvers = (
             await session.execute(
                 select(User)
                 .where(User.is_default_approver.is_(True))
                 .order_by(User.full_name)
             )
         ).scalars().all()
-        for user in extra_defaults:
+        for user in default_approvers:
             _add_approver(user)
 
-        selected = await session.get(User, selected_id)
-        _add_approver(selected)
+        selected = await session.get(User, selected_approver_id)
+        if not selected or selected.is_default_approver:
+            # Только главные согласующие получают такие заявки.
+            pass
+        else:
+            _add_approver(selected)
 
         approvals = []
         for user in ordered_approvers:
@@ -862,7 +1025,7 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
 
         await session.commit()
 
-        if not is_excel:
+        if data.get("description_method") != "excel":
             refreshed = await session.execute(
                 select(Request)
                 .where(Request.id == request.id)
@@ -877,9 +1040,8 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
                 .execution_options(populate_existing=True)
             )
             request = refreshed.scalar_one()
-
-            items, attachments = await fetch_request_media(session, request.id)
-            excel_content = build_request_xlsx(request, items, attachments)
+            items_list, attachments_list = await fetch_request_media(session, request.id)
+            excel_content = build_request_xlsx(request, items_list, attachments_list)
             excel_name = f"request_{request.id}.xlsx"
             excel_path = save_bytes_file(excel_content, settings.files_dir, excel_name)
             session.add(
@@ -915,7 +1077,7 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
             for user in ordered_approvers
         ]
         approvers_text = ", ".join(approver_names)
-        await callback.message.answer(
+        await reply_message.answer(
             f"Ваша заявка №{request.id} отправлена на согласование: {approvers_text}."
         )
 
@@ -923,11 +1085,11 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
         next_pending = await _get_next_pending_approval(session, request.id)
         if next_pending:
             approval, approver = next_pending
-            items, attachments = await fetch_request_media(session, request.id)
+            items_list, attachments_list = await fetch_request_media(session, request.id)
             override_tg_id = settings.approval_override_tg_id
             if override_tg_id:
                 await _send_approval_to_chat(
-                    callback.bot, request, approval.id, override_tg_id, items, attachments
+                    bot, request, approval.id, override_tg_id, items_list, attachments_list
                 )
             else:
                 target_user = (
@@ -936,7 +1098,7 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
                 if target_user.tg_id:
                     if approver.is_default_approver:
                         await send_to_user(
-                            callback.bot,
+                            bot,
                             target_user,
                             (
                                 f"📌 Заявка №{request.id} требует согласования, "
@@ -945,23 +1107,1006 @@ async def create_request_approver(callback: CallbackQuery, state: FSMContext) ->
                         )
                     else:
                         await _send_request_with_attachments(
-                            callback.bot, request, target_user, items, attachments
+                            bot, request, target_user, items_list, attachments_list
                         )
                         await send_to_user(
-                            callback.bot,
+                            bot,
                             target_user,
                             "Примите решение по заявке:",
                             reply_markup=approval_action_keyboard(approval.id),
                         )
 
-    excel_groups = data.get("excel_groups")
-    if excel_groups:
-        next_index = data.get("excel_group_index", 0) + 1
-        if next_index < len(excel_groups):
-            await state.update_data(excel_group_index=next_index)
-            await _prompt_excel_approver(callback.message, state)
-            await callback.answer()
+        return request
+
+
+@router.message(F.text == "📥 Скачать шаблон заявки")
+async def download_request_template(message: Message, state: FSMContext) -> None:
+    await cleanup_main_menu(message, state)
+    await state.clear()
+    await _start_template_download(message.bot, state, fallback_message=message)
+
+
+@router.message(F.text == "📝 Создать заявку")
+async def create_request_start(message: Message, state: FSMContext) -> None:
+    await cleanup_main_menu(message, state)
+    await state.clear()
+    async with SessionLocal() as session:
+        username = await ensure_username_format(message.from_user.username)
+        user = await get_or_create_user(
+            session, message.from_user.id, username, message.from_user.full_name
+        )
+        await session.commit()
+    initiator_name = _normalize_text(user.full_name) or _normalize_text(user.tg_username)
+    await state.set_state(RequestCreate.menu)
+    await state.update_data(
+        request_method=None,
+        description_method=None,
+        initiator_id=user.id,
+        initiator_name=initiator_name,
+        initiator_tg_name=message.from_user.full_name,
+        contract_max_price=None,
+        bdds_article_category=None,
+        items=[],
+    )
+    sent = await message.answer(
+        _request_menu_text(await state.get_data()),
+        reply_markup=_request_menu_keyboard(await state.get_data()),
+    )
+    await state.update_data(req_message_id=sent.message_id, req_chat_id=sent.chat.id)
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_template")
+async def request_template_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _start_template_download(
+        callback.bot, state, fallback_message=callback.message, return_to_request=True
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(TemplateDownload), F.data == "tmpl_cancel")
+async def template_download_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await _finish_template_download(
+        callback.bot, state, fallback_message=callback.message, cancelled=True
+    )
+    await callback.answer()
+
+
+@router.callback_query(TemplateDownload.department, F.data.startswith("tmpl_dep_list:"))
+async def template_departments_page(callback: CallbackQuery, state: FSMContext) -> None:
+    page = int(callback.data.split(":")[1])
+    await _show_template_departments(
+        callback.bot, state, page=page, fallback_message=callback.message
+    )
+    await callback.answer()
+
+
+@router.callback_query(TemplateDownload.department, F.data.startswith("tmpl_dep_pick:"))
+async def template_department_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    _, dep_id, _page = callback.data.split(":")
+    dep_id = int(dep_id)
+    async with SessionLocal() as session:
+        department = await session.get(Department, dep_id)
+    if not department:
+        await callback.answer("Подразделение не найдено.")
+        return
+    await state.update_data(
+        tmpl_department_id=department.id,
+        tmpl_department_name=department.name,
+    )
+    await state.set_state(TemplateDownload.cfo)
+    await _show_template_cfos(callback.bot, state, page=1, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(TemplateDownload.cfo, F.data == "tmpl_dep_back")
+async def template_back_departments(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(TemplateDownload.department)
+    await _show_template_departments(
+        callback.bot, state, page=1, fallback_message=callback.message
+    )
+    await callback.answer()
+
+
+@router.callback_query(TemplateDownload.cfo, F.data.startswith("tmpl_cfo_list:"))
+async def template_cfo_page(callback: CallbackQuery, state: FSMContext) -> None:
+    page = int(callback.data.split(":")[1])
+    await _show_template_cfos(callback.bot, state, page=page, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(TemplateDownload.cfo, F.data.startswith("tmpl_cfo_pick:"))
+async def template_cfo_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    _, cfo_id, _page = callback.data.split(":")
+    cfo_id = int(cfo_id)
+    async with SessionLocal() as session:
+        cfo = await session.get(Cfo, cfo_id)
+        username = await ensure_username_format(callback.from_user.username)
+        initiator = await get_or_create_user(
+            session,
+            tg_id=callback.from_user.id,
+            username=username,
+            full_name=callback.from_user.full_name,
+        )
+        await session.commit()
+    if not cfo:
+        await callback.answer("ЦФО не найдено.")
+        return
+    data = await state.get_data()
+    department_name = data.get("tmpl_department_name")
+    if not department_name:
+        await callback.answer("Не выбрано подразделение.")
+        return
+    initiator_name = initiator.full_name or callback.from_user.full_name
+    try:
+        content = build_request_template_prefilled_xlsx(
+            department_name=department_name,
+            cfo_name=cfo.name,
+            initiator_name=initiator_name,
+        )
+    except FileNotFoundError:
+        await callback.message.answer("Шаблон заявки не найден. Сообщите администратору.")
+        await _finish_template_download(callback.bot, state, fallback_message=callback.message)
+        await callback.answer()
+        return
+
+    await callback.message.answer_document(
+        BufferedInputFile(content, filename=_TEMPLATE_PATH.name),
+        caption="Шаблон заявки",
+    )
+    await _finish_template_download(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_menu")
+async def request_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(RequestCreate.menu)
+    await _show_request_menu(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_cancel")
+async def request_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await _delete_tracked_message(
+        callback.bot,
+        state,
+        "req_message_id",
+        "req_chat_id",
+        fallback_message=callback.message,
+    )
+    await state.clear()
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data.startswith("req_method:"))
+async def request_set_method(callback: CallbackQuery, state: FSMContext) -> None:
+    method = callback.data.split(":")[1]
+    reset_payload = {
+        "department_id": None,
+        "department_name": None,
+        "cfo_id": None,
+        "cfo_name": None,
+        "mol_full_name": None,
+        "contract_max_price": None,
+        "bdds_article_category": None,
+        "items": [],
+        "approver_id": None,
+        "approver_name": None,
+        "excel_groups": None,
+        "excel_group_index": None,
+        "excel_file_path": None,
+        "excel_file_name": None,
+    }
+    await state.update_data(request_method=method, description_method=method, **reset_payload)
+    if method == "excel":
+        await state.set_state(RequestCreate.excel_file)
+    else:
+        await state.set_state(RequestCreate.menu)
+    await _show_request_menu(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_excel:upload")
+async def request_excel_upload_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(RequestCreate.excel_file)
+    await _edit_request_message(
+        callback.bot,
+        state,
+        "📄 Ожидаю Excel файл по шаблону. Пришлите его в этот чат.",
+        reply_markup=_request_menu_keyboard(await state.get_data()),
+        fallback_message=callback.message,
+    )
+    await callback.answer("Пришлите Excel файл в чат.")
+
+
+@router.message(RequestCreate.excel_file)
+async def request_excel_upload(message: Message, state: FSMContext) -> None:
+    await state.update_data(request_method="excel", description_method="excel")
+    if not message.document:
+        await message.answer("Пожалуйста, отправьте Excel файл (.xlsx).")
+        return
+    file_name = message.document.file_name or ""
+    if Path(file_name).suffix.lower() != ".xlsx":
+        await message.answer("Нужен файл формата .xlsx. Проверьте и отправьте заново.")
+        await _try_delete_message(message)
+        return
+
+    await _edit_request_message(
+        message.bot,
+        state,
+        "⏳ Файл обрабатывается...",
+        reply_markup=None,
+        fallback_message=message,
+    )
+    await _try_delete_message(message)
+
+    file_path = await save_telegram_file(
+        message.bot,
+        message.document.file_id,
+        dest_dir=settings.files_dir,
+        filename_hint=file_name,
+    )
+    try:
+        parsed = parse_request_template(file_path)
+    except TemplateParseError as exc:
+        await state.set_state(RequestCreate.excel_file)
+        await _show_request_menu(message.bot, state, error=str(exc), fallback_message=message)
+        try:
+            Path(file_path).unlink()
+        except FileNotFoundError:
+            pass
+        return
+    except Exception:
+        logger.exception("Failed to parse request template")
+        await state.set_state(RequestCreate.excel_file)
+        await _show_request_menu(
+            message.bot,
+            state,
+            error="Не удалось прочитать Excel файл. Проверьте шаблон и загрузите заново.",
+            fallback_message=message,
+        )
+        try:
+            Path(file_path).unlink()
+        except FileNotFoundError:
+            pass
+        return
+
+    async with SessionLocal() as session:
+        initiator_rows = (
+            await session.execute(
+                select(User).where(User.full_name == parsed["initiator_name"])
+            )
+        ).scalars().all()
+        if not initiator_rows:
+            await state.set_state(RequestCreate.excel_file)
+            await _show_request_menu(
+                message.bot,
+                state,
+                error=(
+                    "Инициатор из ячейки G2 не найден в базе пользователей. "
+                    "Исправьте ФИО и загрузите файл заново."
+                ),
+                fallback_message=message,
+            )
+            try:
+                Path(file_path).unlink()
+            except FileNotFoundError:
+                pass
+            return
+        if len(initiator_rows) > 1:
+            await state.set_state(RequestCreate.excel_file)
+            await _show_request_menu(
+                message.bot,
+                state,
+                error=(
+                    "Найдено несколько пользователей с таким ФИО инициатора. "
+                    "Уточните ФИО в базе и загрузите файл заново."
+                ),
+                fallback_message=message,
+            )
+            try:
+                Path(file_path).unlink()
+            except FileNotFoundError:
+                pass
+            return
+        initiator = initiator_rows[0]
+
+        dep_rows = await session.execute(select(Department.id, Department.name))
+        department_map = {
+            _normalize_key(name): (dep_id, name) for dep_id, name in dep_rows.all()
+        }
+        cfo_rows = await session.execute(select(Cfo.id, Cfo.name))
+        cfo_map = {_normalize_key(name): (cfo_id, name) for cfo_id, name in cfo_rows.all()}
+        if not cfo_map:
+            await state.set_state(RequestCreate.excel_file)
+            await _show_request_menu(
+                message.bot,
+                state,
+                error="В базе нет ЦФО. Загрузка заявки невозможна.",
+                fallback_message=message,
+            )
+            try:
+                Path(file_path).unlink()
+            except FileNotFoundError:
+                pass
             return
 
-    await state.clear()
+        excel_groups = []
+        for group in parsed["groups"]:
+            dept_key = _normalize_key(group["department_name"])
+            dept = department_map.get(dept_key)
+            if not dept:
+                await state.set_state(RequestCreate.excel_file)
+                await _show_request_menu(
+                    message.bot,
+                    state,
+                    error=(
+                        f"Подразделение «{group['department_name']}» не найдено в базе. "
+                        "Исправьте файл и загрузите заново."
+                    ),
+                    fallback_message=message,
+                )
+                try:
+                    Path(file_path).unlink()
+                except FileNotFoundError:
+                    pass
+                return
+            cfo_key = _normalize_key(group["cfo_name"])
+            cfo = cfo_map.get(cfo_key)
+            if not cfo:
+                await state.set_state(RequestCreate.excel_file)
+                await _show_request_menu(
+                    message.bot,
+                    state,
+                    error=(
+                        f"ЦФО «{group['cfo_name']}» не найдено в базе. "
+                        "Исправьте файл и загрузите заново."
+                    ),
+                    fallback_message=message,
+                )
+                try:
+                    Path(file_path).unlink()
+                except FileNotFoundError:
+                    pass
+                return
+            excel_groups.append(
+                {
+                    "department_id": dept[0],
+                    "department_name": dept[1],
+                    "cfo_id": cfo[0],
+                    "cfo_name": cfo[1],
+                    "mol_full_name": group["mol_full_name"],
+                    "contract_max_price": group.get("contract_max_price"),
+                    "bdds_article_category": group.get("bdds_article_category"),
+                    "items": group["items"],
+                }
+            )
+
+    if not excel_groups:
+        await state.set_state(RequestCreate.excel_file)
+        await _show_request_menu(
+            message.bot,
+            state,
+            error="В файле нет данных для создания заявки.",
+            fallback_message=message,
+        )
+        try:
+            Path(file_path).unlink()
+        except FileNotFoundError:
+            pass
+        return
+
+    await state.set_state(RequestCreate.menu)
+    await state.update_data(
+        request_method="excel",
+        description_method="excel",
+        initiator_id=initiator.id,
+        initiator_name=initiator.full_name,
+        excel_file_path=file_path,
+        excel_file_name=file_name,
+        excel_groups=excel_groups,
+        excel_group_index=0,
+    )
+    await _show_excel_approver_menu(message, state)
+
+
+async def _show_excel_approver_menu(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    groups = data.get("excel_groups") or []
+    index = data.get("excel_group_index", 0)
+    if index >= len(groups):
+        await _edit_request_message(
+            message.bot,
+            state,
+            "Загрузка заявок завершена.",
+            reply_markup=None,
+            fallback_message=message,
+        )
+        await state.clear()
+        return
+    group = groups[index]
+    await state.update_data(
+        department_id=group["department_id"],
+        department_name=group["department_name"],
+        cfo_id=group["cfo_id"],
+        cfo_name=group["cfo_name"],
+        mol_full_name=group["mol_full_name"],
+        contract_max_price=group.get("contract_max_price"),
+        bdds_article_category=group.get("bdds_article_category"),
+        items=group["items"],
+        approver_id=None,
+        approver_name=None,
+    )
+    async with SessionLocal() as session:
+        approvers = await _fetch_approvers(session)
+    text = (
+        f"Заявка из файла ({index + 1}/{len(groups)})\n"
+        f"Подразделение: {_display_value(group['department_name'])}\n"
+        f"ЦФО: {_display_value(group['cfo_name'])}\n"
+        f"МОЛ: {_display_value(group['mol_full_name'], default='не указан')}\n"
+        "Макс. цена договора (тыс.руб.): "
+        f"{_display_value(group.get('contract_max_price'), default='не задана')}\n"
+        "БДДС (Статья - Категория): "
+        f"{_display_value(group.get('bdds_article_category'), default='не задано')}\n"
+        f"Товары: {len(group.get('items') or [])}\n\n"
+        "Выберите согласующего руководителя."
+    )
+    await _edit_request_message(
+        message.bot,
+        state,
+        text,
+        _approver_keyboard(approvers, back_callback="req_cancel"),
+        fallback_message=message,
+    )
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_field:department")
+async def request_department_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    async with SessionLocal() as session:
+        dep_rows = await session.execute(
+            select(Department.id, Department.name).order_by(Department.name)
+        )
+        deps = dep_rows.all()
+    await _edit_request_message(
+        callback.bot,
+        state,
+        "Выберите подразделение",
+        _departments_keyboard(deps),
+        fallback_message=callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data.startswith("req_department:"))
+async def request_department_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    dep_id = int(callback.data.split(":")[1])
+    async with SessionLocal() as session:
+        dep = await session.get(Department, dep_id)
+    if not dep:
+        await callback.answer("Подразделение не найдено.")
+        return
+    await state.update_data(department_id=dep.id, department_name=dep.name)
+    await _show_request_menu(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_field:cfo")
+async def request_cfo_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    async with SessionLocal() as session:
+        rows = await session.execute(select(Cfo.id, Cfo.name).order_by(Cfo.name))
+        cfos = rows.all()
+    await _edit_request_message(
+        callback.bot,
+        state,
+        "Выберите ЦФО",
+        _cfo_keyboard(cfos),
+        fallback_message=callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data.startswith("req_cfo:"))
+async def request_cfo_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    cfo_id = int(callback.data.split(":")[1])
+    async with SessionLocal() as session:
+        cfo = await session.get(Cfo, cfo_id)
+    if not cfo:
+        await callback.answer("ЦФО не найдено.")
+        return
+    await state.update_data(cfo_id=cfo.id, cfo_name=cfo.name)
+    await _show_request_menu(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_field:mol")
+async def request_mol_input(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(RequestCreate.text_input)
+    await state.update_data(input_target="mol_full_name")
+    await _show_input_prompt(
+        callback.bot,
+        state,
+        "Введите ФИО материально ответственного лица (МОЛ).",
+        "req_input_clear:mol_full_name",
+        "req_menu",
+        fallback_message=callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_field:contract_max_price")
+async def request_contract_max_price_input(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(RequestCreate.text_input)
+    await state.update_data(input_target="contract_max_price")
+    await _show_input_prompt(
+        callback.bot,
+        state,
+        (
+            "Введите начальную (максимальную) цену договора согласно Плану закупок "
+            "с НДС (в тыс.руб.)."
+        ),
+        "req_input_clear:contract_max_price",
+        "req_menu",
+        fallback_message=callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_field:bdds_article_category")
+async def request_bdds_article_category_input(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(RequestCreate.text_input)
+    await state.update_data(input_target="bdds_article_category")
+    await _show_input_prompt(
+        callback.bot,
+        state,
+        (
+            "Введите значение «В соответствии с управлением холдингом 1С» "
+            "(БДДС: Статья ДДС - Товарная категория)."
+        ),
+        "req_input_clear:bdds_article_category",
+        "req_menu",
+        fallback_message=callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_field:approver")
+async def request_approver_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    async with SessionLocal() as session:
+        approvers = await _fetch_approvers(session)
+    await _edit_request_message(
+        callback.bot,
+        state,
+        "Выберите согласующего руководителя",
+        _approver_keyboard(approvers),
+        fallback_message=callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data.startswith("req_approver:"))
+async def request_approver_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    approver_id = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    method = data.get("request_method")
+    async with SessionLocal() as session:
+        user = await session.get(User, approver_id)
+    if not user:
+        await callback.answer("Согласующий не найден.")
+        return
+
+    if method == "excel":
+        request = await _create_request(
+            callback.bot, data, approver_id, callback.from_user, callback.message
+        )
+        if not request:
+            await callback.answer()
+            return
+        next_index = data.get("excel_group_index", 0) + 1
+        await state.update_data(excel_group_index=next_index)
+        await _show_excel_approver_menu(callback.message, state)
+        await callback.answer()
+        return
+
+    approver_name = _normalize_text(user.full_name) or _normalize_text(user.tg_username)
+    await state.update_data(approver_id=user.id, approver_name=approver_name)
+    await _show_request_menu(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_items:menu")
+async def request_items_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    items = data.get("items") or []
+    item_index = data.get("current_item_index")
+    if item_index is not None and item_index < len(items):
+        if _is_item_empty(items[item_index]):
+            items.pop(item_index)
+            await state.update_data(items=items, current_item_index=None)
+    await state.set_state(RequestCreate.menu)
+    await _show_items_menu(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_item_add")
+async def request_item_add(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    items = data.get("items") or []
+    new_item = {"attachments": []}
+    items.append(new_item)
+    item_index = len(items) - 1
+    await state.update_data(items=items, current_item_index=item_index)
+    await state.set_state(RequestCreate.text_input)
+    await state.update_data(input_target="item_name")
+    await _show_input_prompt(
+        callback.bot,
+        state,
+        "Введите наименование товара.",
+        "req_input_clear:item_name",
+        "req_items:menu",
+        fallback_message=callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data.startswith("req_item_edit:"))
+async def request_item_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    item_index = int(callback.data.split(":")[1])
+    await state.set_state(RequestCreate.menu)
+    await state.update_data(current_item_index=item_index)
+    await _show_item_editor(callback.bot, state, item_index, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data.startswith("req_item_delete:"))
+async def request_item_delete(callback: CallbackQuery, state: FSMContext) -> None:
+    item_index = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    items = data.get("items") or []
+    if 0 <= item_index < len(items):
+        items.pop(item_index)
+    current_index = data.get("current_item_index")
+    update_payload = {"items": items}
+    if current_index == item_index:
+        update_payload["current_item_index"] = None
+    await state.update_data(**update_payload)
+    await _show_items_menu(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data.startswith("req_item_field:"))
+async def request_item_field(callback: CallbackQuery, state: FSMContext) -> None:
+    _, item_index, field = callback.data.split(":")
+    item_index = int(item_index)
+    await state.set_state(RequestCreate.text_input)
+    await state.update_data(current_item_index=item_index, input_target=f"item_{field}")
+    prompts = {
+        "name": "Введите наименование товара.",
+        "specs": "Введите технические характеристики.",
+        "brand": "Введите марку устройства или аналог.",
+        "qty": "Введите количество.",
+        "unit": "Введите единицу измерения.",
+        "link": "Введите ссылку на товар (можно несколько строк).",
+        "note": "Введите примечание (при необходимости).",
+    }
+    prompt = prompts.get(field, "Введите значение.")
+    await _show_input_prompt(
+        callback.bot,
+        state,
+        prompt,
+        f"req_input_clear:item_{field}",
+        "req_item_back",
+        fallback_message=callback.message,
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data.startswith("req_item_attachments:"))
+async def request_item_attachments(callback: CallbackQuery, state: FSMContext) -> None:
+    item_index = int(callback.data.split(":")[1])
+    await state.set_state(RequestCreate.item_attachment)
+    await state.update_data(current_item_index=item_index)
+    await _show_attachment_prompt(
+        callback.bot, state, item_index, fallback_message=callback.message
+    )
+    await callback.answer()
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_item_back")
+async def request_item_back(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    item_index = data.get("current_item_index")
+    await state.set_state(RequestCreate.menu)
+    if item_index is not None:
+        await _show_item_editor(
+            callback.bot, state, item_index, fallback_message=callback.message
+        )
+    else:
+        await _show_items_menu(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(RequestCreate.item_attachment, F.data == "req_item_attach_done")
+async def request_item_attach_done(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    item_index = data.get("current_item_index")
+    await state.set_state(RequestCreate.menu)
+    if item_index is not None:
+        await _show_item_editor(
+            callback.bot, state, item_index, fallback_message=callback.message
+        )
+    else:
+        await _show_items_menu(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.callback_query(RequestCreate.item_attachment, F.data == "req_item_attach_clear")
+async def request_item_attach_clear(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    items = data.get("items") or []
+    item_index = data.get("current_item_index")
+    if item_index is None or item_index >= len(items):
+        await _show_items_menu(callback.bot, state, fallback_message=callback.message)
+        await callback.answer()
+        return
+    item = items[item_index]
+    item["attachments"] = []
+    items[item_index] = item
+    await state.update_data(items=items)
+    await _show_attachment_prompt(
+        callback.bot, state, item_index, fallback_message=callback.message
+    )
+    await callback.answer()
+
+
+@router.callback_query(RequestCreate.item_attachment, F.data == "req_item_attach_back")
+async def request_item_attach_back(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    item_index = data.get("current_item_index")
+    await state.set_state(RequestCreate.menu)
+    if item_index is not None:
+        await _show_item_editor(
+            callback.bot, state, item_index, fallback_message=callback.message
+        )
+    else:
+        await _show_items_menu(callback.bot, state, fallback_message=callback.message)
+    await callback.answer()
+
+
+@router.message(RequestCreate.item_attachment)
+async def request_item_attachment(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    items = data.get("items") or []
+    item_index = data.get("current_item_index")
+    if item_index is None or item_index >= len(items):
+        await message.answer("Сначала выберите товар.")
+        await _try_delete_message(message)
+        return
+    item = items[item_index]
+    attachments = item.get("attachments") or []
+    if message.photo:
+        if message.media_group_id:
+            photo = message.photo[-1]
+            await _queue_album_attachment(
+                message,
+                state,
+                {
+                    "file_id": photo.file_id,
+                    "file_unique_id": photo.file_unique_id,
+                    "file_type": "photo",
+                    "file_name": None,
+                    },
+                )
+            await _try_delete_message(message)
+            return
+        photo_count = sum(1 for att in attachments if att.get("file_type") == "photo")
+        if photo_count >= 3:
+            await message.answer("Можно добавить не более 3 фото для товара.")
+            await _try_delete_message(message)
+            return
+        photo = message.photo[-1]
+        attachments.append(
+            {
+                "file_id": photo.file_id,
+                "file_unique_id": photo.file_unique_id,
+                "file_type": "photo",
+                "file_name": None,
+            }
+        )
+        item["attachments"] = attachments
+        items[item_index] = item
+        await state.update_data(items=items)
+        await message.answer("Фото добавлено. Можно отправить еще или нажмите «Готово».")
+        await _try_delete_message(message)
+        return
+    if message.document:
+        if _is_image_document(message):
+            if message.media_group_id:
+                doc = message.document
+                await _queue_album_attachment(
+                    message,
+                    state,
+                    {
+                        "file_id": doc.file_id,
+                        "file_unique_id": doc.file_unique_id,
+                        "file_type": "photo",
+                        "file_name": doc.file_name,
+                    },
+                )
+                await _try_delete_message(message)
+                return
+            photo_count = sum(1 for att in attachments if att.get("file_type") == "photo")
+            if photo_count >= 3:
+                await message.answer("Можно добавить не более 3 фото для товара.")
+                await _try_delete_message(message)
+                return
+            doc = message.document
+            attachments.append(
+                {
+                    "file_id": doc.file_id,
+                    "file_unique_id": doc.file_unique_id,
+                    "file_type": "photo",
+                    "file_name": doc.file_name,
+                }
+            )
+            item["attachments"] = attachments
+            items[item_index] = item
+            await state.update_data(items=items)
+            await message.answer("Фото добавлено. Можно отправить еще или нажмите «Готово».")
+            await _try_delete_message(message)
+            return
+        doc = message.document
+        attachments.append(
+            {
+                "file_id": doc.file_id,
+                "file_unique_id": doc.file_unique_id,
+                "file_type": "document",
+                "file_name": doc.file_name,
+            }
+        )
+        item["attachments"] = attachments
+        items[item_index] = item
+        await state.update_data(items=items)
+        await message.answer("Файл добавлен. Можно отправить еще или нажмите «Готово».")
+        await _try_delete_message(message)
+        return
+    if message.text:
+        current = _normalize_text(item.get("link"))
+        if current:
+            current = f"{current}\n{message.text.strip()}"
+        else:
+            current = message.text.strip()
+        item["link"] = current
+        items[item_index] = item
+        await state.update_data(items=items)
+        await message.answer("Ссылка сохранена. Можно отправить еще или нажмите «Готово».")
+        await _try_delete_message(message)
+        return
+    await message.answer("Отправьте фото, файл или ссылку, либо нажмите «Готово».")
+    await _try_delete_message(message)
+
+
+@router.callback_query(RequestCreate.text_input, F.data.startswith("req_input_clear:"))
+async def request_input_clear(callback: CallbackQuery, state: FSMContext) -> None:
+    target = callback.data.split(":")[1]
+    data = await state.get_data()
+    if target == "mol_full_name":
+        await state.update_data(mol_full_name=None)
+        await state.set_state(RequestCreate.menu)
+        await _show_request_menu(callback.bot, state, fallback_message=callback.message)
+        await callback.answer()
+        return
+    if target == "contract_max_price":
+        await state.update_data(contract_max_price=None)
+        await state.set_state(RequestCreate.menu)
+        await _show_request_menu(callback.bot, state, fallback_message=callback.message)
+        await callback.answer()
+        return
+    if target == "bdds_article_category":
+        await state.update_data(bdds_article_category=None)
+        await state.set_state(RequestCreate.menu)
+        await _show_request_menu(callback.bot, state, fallback_message=callback.message)
+        await callback.answer()
+        return
+    if target.startswith("item_"):
+        items = data.get("items") or []
+        item_index = data.get("current_item_index")
+        if item_index is not None and item_index < len(items):
+            field = target.replace("item_", "")
+            item = items[item_index]
+            item[field] = None
+            items[item_index] = item
+            await state.update_data(items=items)
+        await state.set_state(RequestCreate.menu)
+        if item_index is None:
+            await _show_items_menu(callback.bot, state, fallback_message=callback.message)
+        else:
+            await _show_item_editor(
+                callback.bot, state, item_index, fallback_message=callback.message
+            )
+        await callback.answer()
+        return
+    await callback.answer()
+
+
+@router.message(RequestCreate.text_input)
+async def request_text_input(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        await message.answer("Нужно отправить текст.")
+        await _try_delete_message(message)
+        return
+    data = await state.get_data()
+    target = data.get("input_target")
+    if target == "mol_full_name":
+        await state.update_data(mol_full_name=message.text.strip())
+        await state.set_state(RequestCreate.menu)
+        await _show_request_menu(message.bot, state, fallback_message=message)
+        await _try_delete_message(message)
+        return
+    if target == "contract_max_price":
+        value = message.text.strip()
+        if value.casefold() in {"-", "—", "нет", "пропустить", "skip"}:
+            value = None
+        await state.update_data(contract_max_price=value)
+        await state.set_state(RequestCreate.menu)
+        await _show_request_menu(message.bot, state, fallback_message=message)
+        await _try_delete_message(message)
+        return
+    if target == "bdds_article_category":
+        value = message.text.strip()
+        if value.casefold() in {"-", "—", "нет", "пропустить", "skip"}:
+            value = None
+        await state.update_data(bdds_article_category=value)
+        await state.set_state(RequestCreate.menu)
+        await _show_request_menu(message.bot, state, fallback_message=message)
+        await _try_delete_message(message)
+        return
+    if target and target.startswith("item_"):
+        items = data.get("items") or []
+        item_index = data.get("current_item_index")
+        if item_index is None or item_index >= len(items):
+            await message.answer("Сначала выберите товар.")
+            await _try_delete_message(message)
+            return
+        field = target.replace("item_", "")
+        item = items[item_index]
+        value = message.text.strip()
+        if field == "link":
+            current = _normalize_text(item.get("link"))
+            if current:
+                value = f"{current}\n{value}"
+        item[field] = value
+        items[item_index] = item
+        await state.update_data(items=items)
+        await state.set_state(RequestCreate.menu)
+        await _show_item_editor(message.bot, state, item_index, fallback_message=message)
+        await _try_delete_message(message)
+        return
+    await message.answer("Не удалось распознать поле для ввода.")
+    await _try_delete_message(message)
+
+
+@router.callback_query(StateFilter(RequestCreate), F.data == "req_submit")
+async def request_submit(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    errors = _validate_manual_request(data)
+    if errors:
+        await _show_request_menu(
+            callback.bot,
+            state,
+            error="Нужно заполнить: " + ", ".join(errors),
+            fallback_message=callback.message,
+        )
+        await callback.answer()
+        return
+    request = await _create_request(
+        callback.bot, data, data["approver_id"], callback.from_user, callback.message
+    )
+    if request:
+        await _edit_request_message(
+            callback.bot,
+            state,
+            "Заявка создана.",
+            reply_markup=None,
+            fallback_message=callback.message,
+        )
+        await state.clear()
     await callback.answer()

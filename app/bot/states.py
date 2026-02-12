@@ -2,23 +2,15 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class RequestCreate(StatesGroup):
-    method = State()
-    full_name = State()
+    menu = State()
+    excel_file = State()
+    text_input = State()
+    item_attachment = State()
+
+
+class TemplateDownload(StatesGroup):
     department = State()
     cfo = State()
-    description_method = State()
-    excel_file = State()
-    item_name = State()
-    item_specs = State()
-    item_brand = State()
-    item_qty = State()
-    item_unit = State()
-    item_link_or_photo = State()
-    item_note = State()
-    item_add_more = State()
-    mol_full_name = State()
-    approver_choice = State()
-    attachments = State()
 
 
 class ApprovalComment(StatesGroup):
@@ -63,6 +55,7 @@ class AdminAssignRole(StatesGroup):
 
 class AdminAddUser(StatesGroup):
     full_name = State()
+    tg_username = State()
     role = State()
 
 

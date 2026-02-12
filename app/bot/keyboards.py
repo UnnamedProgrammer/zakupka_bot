@@ -1,4 +1,4 @@
-from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 
@@ -146,16 +146,61 @@ def settings_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="🏷️ ЦФО", callback_data="settings:cfos")
     builder.button(text="👥 Пользователи", callback_data="settings:users")
     builder.button(text="📝 Заявки", callback_data="settings:requests")
+    builder.button(text="⬅️ В главное меню", callback_data="main_menu")
     builder.adjust(1)
     return builder.as_markup()
 
 
-def settings_list_keyboard(prefix: str, items: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+def settings_list_keyboard(
+    prefix: str,
+    items: list[tuple[int, str]],
+    page: int,
+    total_pages: int,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for item_id, name in items:
-        builder.button(text=f"🗑️ {name}", callback_data=f"{prefix}:del:{item_id}")
-    builder.button(text="➕ Добавить", callback_data=f"{prefix}:add")
+        builder.button(text=f"🗑️ {name}", callback_data=f"{prefix}:del:{item_id}:{page}")
     builder.adjust(1)
+    nav_buttons = []
+    if total_pages > 1:
+        if page > 0:
+            nav_buttons.append(
+                InlineKeyboardButton(text="⬅️", callback_data=f"{prefix}:list:{page - 1}")
+            )
+        if page < total_pages - 1:
+            nav_buttons.append(
+                InlineKeyboardButton(text="➡️", callback_data=f"{prefix}:list:{page + 1}")
+            )
+    if nav_buttons:
+        builder.row(*nav_buttons)
+    builder.row(InlineKeyboardButton(text="➕ Добавить", callback_data=f"{prefix}:add"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:menu"))
+    return builder.as_markup()
+
+
+def requests_list_keyboard(
+    items: list[tuple[int, str]],
+    page: int,
+    total_pages: int,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for request_id, label in items:
+        builder.button(text=label, callback_data=f"req_edit:menu:{request_id}")
+    builder.adjust(1)
+    nav_buttons = []
+    if total_pages > 1:
+        if page > 0:
+            nav_buttons.append(
+                InlineKeyboardButton(text="⬅️", callback_data=f"requests:list:{page - 1}")
+            )
+        if page < total_pages - 1:
+            nav_buttons.append(
+                InlineKeyboardButton(text="➡️", callback_data=f"requests:list:{page + 1}")
+            )
+    if nav_buttons:
+        builder.row(*nav_buttons)
+    builder.row(InlineKeyboardButton(text="🔎 Ввести ID", callback_data="requests:enter_id"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:menu"))
     return builder.as_markup()
 
 
@@ -175,13 +220,20 @@ def roles_keyboard(items: list[tuple[int, str]]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def users_menu_keyboard() -> InlineKeyboardMarkup:
+def users_menu_keyboard(role_items: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    role_icons = {
+        "employee": "👤",
+        "approver": "✅",
+        "executor": "🧑‍🔧",
+        "admin": "⚙️",
+    }
     builder = InlineKeyboardBuilder()
     builder.button(text="➕ Добавить пользователя", callback_data="users:add")
-    builder.button(text="👤 Инициаторы", callback_data="users:list:employee")
-    builder.button(text="✅ Руководители", callback_data="users:list:leaders")
-    builder.button(text="🧑‍🔧 Исполнители", callback_data="users:list:executor")
+    for code, name in role_items:
+        icon = role_icons.get(code, "👥")
+        builder.button(text=f"{icon} {name}", callback_data=f"users:list:{code}")
     builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:menu"))
     return builder.as_markup()
 
 

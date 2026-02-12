@@ -41,10 +41,20 @@ from app.services.users import (
     get_user_role_codes,
 )
 from app.services.datetime import to_naive_utc
+from app.bot.handlers.common import cleanup_main_menu
 
 router = Router()
 LEADER_LIST_PAGE_SIZE = 6
 INITIATOR_LIST_PAGE_SIZE = 6
+
+
+async def _store_my_requests_message(state: FSMContext | None, message: Message) -> None:
+    if not state or not message.chat:
+        return
+    await state.update_data(
+        my_requests_message_id=message.message_id,
+        my_requests_chat_id=message.chat.id,
+    )
 
 
 async def _get_status_id(session, model, code: str) -> int:
@@ -97,6 +107,12 @@ def _leader_list_keyboard(
             )
     if nav_buttons:
         builder.row(*nav_buttons)
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ В главное меню",
+            callback_data="main_menu",
+        )
+    )
     return builder
 
 
@@ -172,6 +188,12 @@ def _initiator_list_keyboard(
             )
     if nav_buttons:
         builder.row(*nav_buttons)
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ В главное меню",
+            callback_data="main_menu",
+        )
+    )
     return builder
 
 
@@ -292,16 +314,20 @@ async def _show_leader_list(
     approver_id: int,
     page: int,
     edit: bool = False,
+    state: FSMContext | None = None,
 ) -> None:
     async with SessionLocal() as session:
         approvals = await _fetch_leader_approvals(session, approver_id)
     total = len(approvals)
     if total == 0:
         text = "У вас нет заявок на согласование."
+        markup = _leader_list_keyboard([], 1, 1).as_markup()
         if edit:
-            await message.edit_text(text)
+            await message.edit_text(text, reply_markup=markup)
+            await _store_my_requests_message(state, message)
         else:
-            await message.answer(text)
+            sent = await message.answer(text, reply_markup=markup)
+            await _store_my_requests_message(state, sent)
         return
     total_pages = max(1, math.ceil(total / LEADER_LIST_PAGE_SIZE))
     page = max(1, min(page, total_pages))
@@ -311,8 +337,10 @@ async def _show_leader_list(
     markup = _leader_list_keyboard(rows, page, total_pages).as_markup()
     if edit:
         await message.edit_text(text, reply_markup=markup)
+        await _store_my_requests_message(state, message)
     else:
-        await message.answer(text, reply_markup=markup)
+        sent = await message.answer(text, reply_markup=markup)
+        await _store_my_requests_message(state, sent)
 
 
 async def _fetch_initiator_requests(session, initiator_id: int) -> list[Request]:
@@ -330,16 +358,20 @@ async def _show_initiator_list(
     initiator_id: int,
     page: int,
     edit: bool = False,
+    state: FSMContext | None = None,
 ) -> None:
     async with SessionLocal() as session:
         requests = await _fetch_initiator_requests(session, initiator_id)
     total = len(requests)
     if total == 0:
         text = "У вас нет созданных заявок."
+        markup = _initiator_list_keyboard([], 1, 1).as_markup()
         if edit:
-            await message.edit_text(text)
+            await message.edit_text(text, reply_markup=markup)
+            await _store_my_requests_message(state, message)
         else:
-            await message.answer(text)
+            sent = await message.answer(text, reply_markup=markup)
+            await _store_my_requests_message(state, sent)
         return
     total_pages = max(1, math.ceil(total / INITIATOR_LIST_PAGE_SIZE))
     page = max(1, min(page, total_pages))
@@ -349,12 +381,15 @@ async def _show_initiator_list(
     markup = _initiator_list_keyboard(requests_page, page, total_pages).as_markup()
     if edit:
         await message.edit_text(text, reply_markup=markup)
+        await _store_my_requests_message(state, message)
     else:
-        await message.answer(text, reply_markup=markup)
+        sent = await message.answer(text, reply_markup=markup)
+        await _store_my_requests_message(state, sent)
 
 
 @router.message(F.text == "📌 Мои заявки")
 async def my_requests(message: Message, state: FSMContext) -> None:
+    await cleanup_main_menu(message, state)
     async with SessionLocal() as session:
         username = await ensure_username_format(message.from_user.username)
         user = await get_or_create_user(
@@ -363,14 +398,14 @@ async def my_requests(message: Message, state: FSMContext) -> None:
         role_codes = await get_user_role_codes(session, user.id)
     await state.clear()
     if "approver" in role_codes or user.is_default_approver:
-        await _show_leader_list(message, user.id, page=1, edit=False)
+        await _show_leader_list(message, user.id, page=1, edit=False, state=state)
         return
     if "executor" in role_codes:
         from app.bot.handlers.executor import _show_my_list  # local import to avoid cycles
 
-        await _show_my_list(message, user.id, page=1, edit=False)
+        await _show_my_list(message, user.id, page=1, edit=False, state=state)
         return
-    await _show_initiator_list(message, user.id, page=1, edit=False)
+    await _show_initiator_list(message, user.id, page=1, edit=False, state=state)
 
 
 @router.callback_query(F.data.startswith("leader_list:"))
@@ -387,12 +422,12 @@ async def leader_list(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.answer("Нет доступа")
             return
     await state.clear()
-    await _show_leader_list(callback.message, user.id, page=page, edit=True)
+    await _show_leader_list(callback.message, user.id, page=page, edit=True, state=state)
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("leader_pick:"))
-async def leader_pick(callback: CallbackQuery) -> None:
+async def leader_pick(callback: CallbackQuery, state: FSMContext) -> None:
     _, approval_id_str, page_str = callback.data.split(":")
     approval_id = int(approval_id_str)
     page = int(page_str) if page_str.isdigit() else 1
@@ -428,6 +463,7 @@ async def leader_pick(callback: CallbackQuery) -> None:
         format_request_summary(request),
         reply_markup=_leader_actions_keyboard(approval_id, page, pending),
     )
+    await _store_my_requests_message(state, callback.message)
     await callback.answer()
 
 
@@ -441,12 +477,12 @@ async def initiator_list(callback: CallbackQuery, state: FSMContext) -> None:
             session, callback.from_user.id, username, callback.from_user.full_name
         )
     await state.clear()
-    await _show_initiator_list(callback.message, user.id, page=page, edit=True)
+    await _show_initiator_list(callback.message, user.id, page=page, edit=True, state=state)
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("initiator_pick:"))
-async def initiator_pick(callback: CallbackQuery) -> None:
+async def initiator_pick(callback: CallbackQuery, state: FSMContext) -> None:
     _, request_id_str, page_str = callback.data.split(":")
     request_id = int(request_id_str)
     page = int(page_str) if page_str.isdigit() else 1
@@ -466,6 +502,7 @@ async def initiator_pick(callback: CallbackQuery) -> None:
         format_request_summary(request),
         reply_markup=_initiator_actions_keyboard(page),
     )
+    await _store_my_requests_message(state, callback.message)
     await callback.answer()
 
 

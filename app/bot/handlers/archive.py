@@ -31,6 +31,7 @@ from app.services.excel import (
 )
 from app.services.files import save_telegram_file
 from app.services.users import ensure_username_format, get_or_create_user, get_user_role_codes
+from app.bot.handlers.common import cleanup_main_menu
 
 router = Router()
 
@@ -530,6 +531,7 @@ async def _load_archive_requests(session, data: dict) -> list[Request]:
 
 @router.message(F.text == "📚 Архив")
 async def archive_start(message: Message, state: FSMContext) -> None:
+    await cleanup_main_menu(message, state)
     await state.clear()
     async with SessionLocal() as session:
         username = await ensure_username_format(message.from_user.username)

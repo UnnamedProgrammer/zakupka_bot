@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Iterable
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, range_boundaries
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from sqlalchemy import select, inspect
 from sqlalchemy.orm import selectinload
@@ -64,97 +64,156 @@ def _normalize_header(value) -> str:
     return _normalize_cell(value).casefold()
 
 
+def _clean_optional_cell(value) -> str | None:
+    text = _normalize_cell(value)
+    if not text:
+        return None
+    lowered = text.casefold()
+    if lowered in {"-", "—", "нет", "пропустить", "skip"}:
+        return None
+    return text
+
+
+def _ensure_merged(ws, cell_range: str, force: bool = False) -> None:
+    try:
+        min_col, min_row, max_col, max_row = range_boundaries(cell_range)
+    except ValueError:
+        return
+    overlaps: list[str] = []
+    for merged in ws.merged_cells.ranges:
+        if merged.coord == cell_range:
+            return
+        if (
+            min_row <= merged.max_row
+            and max_row >= merged.min_row
+            and min_col <= merged.max_col
+            and max_col >= merged.min_col
+        ):
+            if (
+                min_row >= merged.min_row
+                and max_row <= merged.max_row
+                and min_col >= merged.min_col
+                and max_col <= merged.max_col
+            ):
+                return
+            if not force:
+                return
+            if (
+                min_row <= merged.min_row
+                and max_row >= merged.max_row
+                and min_col <= merged.min_col
+                and max_col >= merged.max_col
+            ):
+                overlaps.append(merged.coord)
+            else:
+                return
+    for coord in overlaps:
+        ws.unmerge_cells(coord)
+    ws.merge_cells(cell_range)
+
+
 def parse_request_template(path: str) -> dict:
     wb = load_workbook(path, data_only=True)
     ws = wb.active
 
-    initiator_name = _normalize_cell(ws["G2"].value)
+    initiator_name = _normalize_cell(ws["E2"].value)
     if not initiator_name:
-        raise TemplateParseError("В ячейке G2 не указан инициатор заявки.")
+        raise TemplateParseError("В ячейке E2 не указан инициатор заявки.")
 
-    groups: dict[str, dict] = {}
-    group_order: list[str] = []
+    template_department = _normalize_cell(ws["E4"].value)
+    if not template_department:
+        raise TemplateParseError("В ячейке E4 не указано подразделение.")
+
+    template_cfo = _normalize_cell(ws["E5"].value)
+    if not template_cfo:
+        raise TemplateParseError("В ячейке E5 не указано ЦФО.")
+
     rows_found = 0
+    mol_full_name: str | None = None
+    contract_max_price: str | None = None
+    bdds_article_category: str | None = None
+    items: list[dict] = []
 
-    for row_idx in range(6, ws.max_row + 1):
-        values = [_normalize_cell(ws.cell(row=row_idx, column=col).value) for col in range(1, 13)]
+    for row_idx in range(7, ws.max_row + 1):
+        raw_values = [ws.cell(row=row_idx, column=col).value for col in range(1, 9)]
+        values = [_normalize_cell(value) for value in raw_values]
         if not any(values):
             if rows_found:
                 break
             continue
         rows_found += 1
 
-        (
-            omts_responsible,
-            category,
-            name,
-            specs,
-            dds_article,
-            qty,
-            unit,
-            max_price,
-            department,
-            cfo_name,
-            mol_full_name,
-            note,
-        ) = values
-
+        row_mol, name, specs, qty, unit, note, max_price, bdds_value = values
+        cleaned_specs = _clean_optional_cell(raw_values[2])
+        cleaned_note = _clean_optional_cell(raw_values[5])
         if not name:
             raise TemplateParseError(f"Строка {row_idx}: не заполнено \"Наименование\".")
         if not qty:
-            raise TemplateParseError(f"Строка {row_idx}: не заполнено \"Кол-во\".")
+            raise TemplateParseError(f"Строка {row_idx}: не заполнено \"Количество\".")
         if not unit:
             raise TemplateParseError(f"Строка {row_idx}: не заполнено \"Ед. измерения\".")
-        if not department:
-            raise TemplateParseError(f"Строка {row_idx}: не заполнено \"Подразделение\".")
-        if not cfo_name:
-            raise TemplateParseError(f"Строка {row_idx}: не заполнено \"ЦФО\".")
-        if not mol_full_name:
+        if not row_mol:
             raise TemplateParseError(f"Строка {row_idx}: не заполнено \"МОЛ\".")
 
-        dept_key = department.casefold()
-        group = groups.get(dept_key)
-        if not group:
-            group = {
-                "department_name": department,
-                "cfo_name": cfo_name,
-                "mol_full_name": mol_full_name,
-                "items": [],
-            }
-            groups[dept_key] = group
-            group_order.append(dept_key)
-        elif group["cfo_name"].casefold() != cfo_name.casefold():
+        if mol_full_name is None:
+            mol_full_name = row_mol
+        elif mol_full_name.casefold() != row_mol.casefold():
             raise TemplateParseError(
-                f"Строка {row_idx}: для подразделения \"{group['department_name']}\" указан другой ЦФО."
-            )
-        elif group["mol_full_name"].casefold() != mol_full_name.casefold():
-            raise TemplateParseError(
-                f"Строка {row_idx}: для подразделения \"{group['department_name']}\" указан другой МОЛ."
+                f"Строка {row_idx}: указан другой МОЛ. Ожидается: {mol_full_name}."
             )
 
-        group["items"].append(
+        row_price = _clean_optional_cell(raw_values[6])
+        if row_price:
+            if contract_max_price is None:
+                contract_max_price = row_price
+            elif contract_max_price.casefold() != row_price.casefold():
+                raise TemplateParseError(
+                    f"Строка {row_idx}: указана другая макс. цена договора. "
+                    f"Ожидается: {contract_max_price}."
+                )
+
+        row_bdds = _clean_optional_cell(raw_values[7])
+        if row_bdds:
+            if bdds_article_category is None:
+                bdds_article_category = row_bdds
+            elif bdds_article_category.casefold() != row_bdds.casefold():
+                raise TemplateParseError(
+                    f"Строка {row_idx}: указано другое значение БДДС. "
+                    f"Ожидается: {bdds_article_category}."
+                )
+
+        items.append(
             {
                 "name": name,
-                "specs": specs or None,
+                "specs": cleaned_specs,
                 "brand": None,
                 "qty": qty,
                 "unit": unit,
                 "link": None,
-                "note": note or None,
-                "omts_responsible": omts_responsible or None,
-                "category": category or None,
-                "dds_article": dds_article or None,
-                "max_price": max_price or None,
+                "note": cleaned_note,
+                "omts_responsible": None,
+                "category": None,
+                "dds_article": None,
+                "max_price": None,
                 "attachments": [],
             }
         )
 
-    if not group_order:
-        raise TemplateParseError("В файле не найдены строки с товарами (начиная с 6-й строки).")
+    if not items:
+        raise TemplateParseError("В файле не найдены строки с товарами (начиная с 7-й строки).")
 
     return {
         "initiator_name": initiator_name,
-        "groups": [groups[key] for key in group_order],
+        "groups": [
+            {
+                "department_name": template_department,
+                "cfo_name": template_cfo,
+                "mol_full_name": mol_full_name,
+                "contract_max_price": contract_max_price,
+                "bdds_article_category": bdds_article_category,
+                "items": items,
+            }
+        ],
     }
 
 
@@ -173,11 +232,16 @@ def build_request_template_xlsx(
     department = _get_loaded(request, "department")
     cfo = _get_loaded(request, "cfo")
 
-    ws["G2"] = initiator.full_name if initiator else ""
+    ws["E2"] = initiator.full_name if initiator else ""
+    ws["E4"] = department.name if department else ""
+    ws["E5"] = cfo.name if cfo else ""
+    ws["E2"].alignment = Alignment(vertical="center", wrap_text=True)
+    ws["E4"].alignment = Alignment(vertical="center", wrap_text=True)
+    ws["E5"].alignment = Alignment(vertical="center", wrap_text=True)
 
-    department_name = department.name if department else ""
-    cfo_name = cfo.name if cfo else ""
     mol_name = request.mol_full_name or ""
+    contract_max_price = request.contract_max_price or ""
+    bdds_article_category = request.bdds_article_category or ""
 
     items_list = list(items or [])
     if not items_list and (
@@ -197,20 +261,43 @@ def build_request_template_xlsx(
             )
         ]
 
-    row_idx = 6
+    row_idx = 7
     for item in items_list:
-        dds = _get_loaded(item, "dds_article")
-        ws.cell(row=row_idx, column=3, value=item.name)
-        ws.cell(row=row_idx, column=4, value=item.specs)
-        ws.cell(row=row_idx, column=5, value=dds.name if dds else None)
-        ws.cell(row=row_idx, column=6, value=item.qty)
-        ws.cell(row=row_idx, column=7, value=item.unit)
-        ws.cell(row=row_idx, column=8, value=item.max_price)
-        ws.cell(row=row_idx, column=9, value=department_name)
-        ws.cell(row=row_idx, column=10, value=cfo_name)
-        ws.cell(row=row_idx, column=11, value=mol_name)
-        ws.cell(row=row_idx, column=12, value=item.note)
+        ws.cell(row=row_idx, column=1, value=mol_name)
+        ws.cell(row=row_idx, column=2, value=item.name)
+        ws.cell(row=row_idx, column=3, value=item.specs)
+        ws.cell(row=row_idx, column=4, value=item.qty)
+        ws.cell(row=row_idx, column=5, value=item.unit)
+        ws.cell(row=row_idx, column=6, value=item.note)
+        ws.cell(row=row_idx, column=7, value=contract_max_price)
+        ws.cell(row=row_idx, column=8, value=bdds_article_category)
         row_idx += 1
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def build_request_template_prefilled_xlsx(
+    department_name: str | None,
+    cfo_name: str | None,
+    initiator_name: str | None = None,
+    template_path: str | Path = REQUEST_TEMPLATE_PATH,
+) -> bytes:
+    path = Path(template_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Template not found: {path}")
+    wb = load_workbook(path)
+    ws = wb.active
+
+    if initiator_name:
+        ws["E2"] = initiator_name
+    if department_name:
+        ws["E4"] = department_name
+        ws["E4"].alignment = Alignment(vertical="center", wrap_text=True)
+    if cfo_name:
+        ws["E5"] = cfo_name
+        ws["E5"].alignment = Alignment(vertical="center", wrap_text=True)
 
     bio = BytesIO()
     wb.save(bio)

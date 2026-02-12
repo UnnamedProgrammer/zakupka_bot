@@ -37,6 +37,8 @@ def format_request_summary(req: Request) -> str:
         f"Подразделение: {department_name}",
         f"ЦФО: {cfo_name}",
         f"МОЛ: {req.mol_full_name or '-'}",
+        f"Макс. цена договора (тыс.руб.): {req.contract_max_price or '-'}",
+        f"БДДС (Статья - Категория): {req.bdds_article_category or '-'}",
         f"Срок поставки: {expected_delivery}",
         f"Статус: {status_name}",
     ]

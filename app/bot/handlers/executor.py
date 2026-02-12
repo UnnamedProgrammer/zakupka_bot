@@ -55,6 +55,7 @@ from app.services.notifications import send_to_user
 from app.services.users import ensure_username_format, get_or_create_user, user_has_role
 from app.services.datetime import to_naive_utc
 from app.config import settings
+from app.bot.handlers.common import cleanup_main_menu
 
 router = Router()
 
@@ -376,6 +377,12 @@ def _my_list_keyboard(
             )
     if nav_buttons:
         builder.row(*nav_buttons)
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ В главное меню",
+            callback_data="main_menu",
+        )
+    )
     return builder
 
 
@@ -384,16 +391,28 @@ async def _show_my_list(
     executor_id: int,
     page: int,
     edit: bool = False,
+    state: FSMContext | None = None,
 ) -> None:
     async with SessionLocal() as session:
         requests = await _fetch_my_requests(session, executor_id)
     total = len(requests)
     if total == 0:
         text = "У вас нет назначенных заявок."
+        markup = _my_list_keyboard([], 1, 1).as_markup()
         if edit:
-            await message.edit_text(text)
+            await message.edit_text(text, reply_markup=markup)
+            if state and message.chat:
+                await state.update_data(
+                    my_requests_message_id=message.message_id,
+                    my_requests_chat_id=message.chat.id,
+                )
         else:
-            await message.answer(text)
+            sent = await message.answer(text, reply_markup=markup)
+            if state and sent.chat:
+                await state.update_data(
+                    my_requests_message_id=sent.message_id,
+                    my_requests_chat_id=sent.chat.id,
+                )
         return
     total_pages = max(1, math.ceil(total / MY_LIST_PAGE_SIZE))
     page = max(1, min(page, total_pages))
@@ -403,8 +422,18 @@ async def _show_my_list(
     markup = _my_list_keyboard(requests_page, page, total_pages).as_markup()
     if edit:
         await message.edit_text(text, reply_markup=markup)
+        if state and message.chat:
+            await state.update_data(
+                my_requests_message_id=message.message_id,
+                my_requests_chat_id=message.chat.id,
+            )
     else:
-        await message.answer(text, reply_markup=markup)
+        sent = await message.answer(text, reply_markup=markup)
+        if state and sent.chat:
+            await state.update_data(
+                my_requests_message_id=sent.message_id,
+                my_requests_chat_id=sent.chat.id,
+            )
 
 
 async def _is_executor(session, user_id: int) -> bool:
@@ -1098,7 +1127,7 @@ async def my_list(callback: CallbackQuery, state: FSMContext) -> None:
             await callback.answer("Доступно только исполнителям.")
             return
     await state.clear()
-    await _show_my_list(callback.message, user.id, page=page, edit=True)
+    await _show_my_list(callback.message, user.id, page=page, edit=True, state=state)
     await callback.answer()
 
 
@@ -1130,7 +1159,7 @@ async def my_pick(callback: CallbackQuery, state: FSMContext) -> None:
         if not await _ensure_executor_for_request(session, callback.from_user, request):
             await callback.answer("Нет доступа")
             return
-    await state.clear()
+    await state.set_state(None)
     back_data = f"my_list:{page}"
     attachments_data = f"my_attach:{request_id}:{page}"
     await callback.message.edit_text(
@@ -1139,6 +1168,11 @@ async def my_pick(callback: CallbackQuery, state: FSMContext) -> None:
             request, back_data, attachments_data=attachments_data
         ),
     )
+    if callback.message.chat:
+        await state.update_data(
+            my_requests_message_id=callback.message.message_id,
+            my_requests_chat_id=callback.message.chat.id,
+        )
     await callback.answer()
 
 
@@ -1179,6 +1213,7 @@ async def my_attach(callback: CallbackQuery) -> None:
     )
 )
 async def export_daily_requests(message: Message, state: FSMContext) -> None:
+    await cleanup_main_menu(message, state)
     async with SessionLocal() as session:
         username = await ensure_username_format(message.from_user.username)
         user = await get_or_create_user(
@@ -1252,6 +1287,7 @@ async def daily_pick(callback: CallbackQuery) -> None:
     )
 )
 async def export_employee_stats(message: Message, state: FSMContext) -> None:
+    await cleanup_main_menu(message, state)
     async with SessionLocal() as session:
         rows = await session.execute(
             select(Request)
@@ -1504,6 +1540,7 @@ async def export_edit_upload(message: Message, state: FSMContext) -> None:
 
 @router.message(F.text == "📅 Срок поставки")
 async def delivery_menu(message: Message, state: FSMContext) -> None:
+    await cleanup_main_menu(message, state)
     async with SessionLocal() as session:
         username = await ensure_username_format(message.from_user.username)
         user = await get_or_create_user(

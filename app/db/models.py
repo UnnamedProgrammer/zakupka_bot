@@ -157,6 +157,8 @@ class Request(Base):
     supplier_name: Mapped[str | None] = mapped_column(String(200))
 
     mol_full_name: Mapped[str | None] = mapped_column(String(200))
+    contract_max_price: Mapped[str | None] = mapped_column(String(50))
+    bdds_article_category: Mapped[str | None] = mapped_column(Text)
 
     executor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     expected_delivery_at: Mapped[dt.date | None] = mapped_column(Date)
