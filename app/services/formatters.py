@@ -1,6 +1,7 @@
 from sqlalchemy import inspect
 
 from app.db.models import Request
+from app.services.constants import REQUEST_STATUS_APPROVED
 
 
 def _get_loaded(obj, attr: str):
@@ -8,6 +9,19 @@ def _get_loaded(obj, attr: str):
     if attr in state.unloaded:
         return None
     return getattr(obj, attr)
+
+
+def get_request_status_label(req: Request) -> str:
+    status = _get_loaded(req, "status")
+    status_name = status.name if status else "-"
+    status_code = status.code if status else None
+
+    if req.executor_id is None and (
+        status_code == REQUEST_STATUS_APPROVED
+        or (status_name or "").strip().casefold() == "выбор исполнителя"
+    ):
+        return "Требуется выбрать исполнителя"
+    return status_name or "-"
 
 
 def format_request_summary(req: Request) -> str:
@@ -23,7 +37,7 @@ def format_request_summary(req: Request) -> str:
     initiator_name = initiator.full_name if initiator else "не указано"
     department_name = department.name if department else "-"
     cfo_name = cfo.name if cfo else "-"
-    status_name = status.name if status else "-"
+    status_name = get_request_status_label(req)
     created_at = req.created_at.strftime("%d-%m-%Y %H:%M") if req.created_at else "-"
     done_at = req.done_at.strftime("%d-%m-%Y %H:%M") if req.done_at else "-"
     expected_delivery = (
@@ -35,7 +49,7 @@ def format_request_summary(req: Request) -> str:
         f"Дата выполнения: {done_at}",
         f"Инициатор: {initiator_name}{username_display}",
         f"Подразделение: {department_name}",
-        f"ЦФО: {cfo_name}",
+        f"ЦФО (Бюджет): {cfo_name}",
         f"МОЛ: {req.mol_full_name or '-'}",
         f"Макс. цена договора (тыс.руб.): {req.contract_max_price or '-'}",
         f"БДДС (Статья - Категория): {req.bdds_article_category or '-'}",

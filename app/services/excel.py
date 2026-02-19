@@ -29,7 +29,7 @@ REQUESTS_REPORT_HEADERS = [
     "Дата обновления",
     "Инициатор",
     "Подразделение",
-    "ЦФО",
+    "ЦФО (Бюджет)",
     "МОЛ",
     "Статус",
     "Исполнитель",
@@ -126,7 +126,7 @@ def parse_request_template(path: str) -> dict:
 
     template_cfo = _normalize_cell(ws["E5"].value)
     if not template_cfo:
-        raise TemplateParseError("В ячейке E5 не указано ЦФО.")
+        raise TemplateParseError("В ячейке E5 не указано ЦФО (Бюджет).")
 
     rows_found = 0
     mol_full_name: str | None = None
@@ -206,7 +206,7 @@ def parse_request_template(path: str) -> dict:
         "initiator_name": initiator_name,
         "groups": [
             {
-                "department_name": template_department,
+                "department_name": template_department or None,
                 "cfo_name": template_cfo,
                 "mol_full_name": mol_full_name,
                 "contract_max_price": contract_max_price,
@@ -232,7 +232,7 @@ def build_request_template_xlsx(
     department = _get_loaded(request, "department")
     cfo = _get_loaded(request, "cfo")
 
-    ws["E2"] = initiator.full_name if initiator else ""
+    ws["E2"] = (initiator.full_name or initiator.tg_username or "") if initiator else ""
     ws["E4"] = department.name if department else ""
     ws["E5"] = cfo.name if cfo else ""
     ws["E2"].alignment = Alignment(vertical="center", wrap_text=True)
@@ -290,14 +290,12 @@ def build_request_template_prefilled_xlsx(
     wb = load_workbook(path)
     ws = wb.active
 
-    if initiator_name:
-        ws["E2"] = initiator_name
-    if department_name:
-        ws["E4"] = department_name
-        ws["E4"].alignment = Alignment(vertical="center", wrap_text=True)
-    if cfo_name:
-        ws["E5"] = cfo_name
-        ws["E5"].alignment = Alignment(vertical="center", wrap_text=True)
+    ws["E2"] = initiator_name or ""
+    ws["E4"] = department_name or ""
+    ws["E5"] = cfo_name or ""
+    ws["E2"].alignment = Alignment(vertical="center", wrap_text=True)
+    ws["E4"].alignment = Alignment(vertical="center", wrap_text=True)
+    ws["E5"].alignment = Alignment(vertical="center", wrap_text=True)
 
     bio = BytesIO()
     wb.save(bio)
@@ -432,7 +430,7 @@ def build_archive_xlsx(requests: Iterable[Request]) -> bytes:
         "Дата создания",
         "Инициатор",
         "Подразделение",
-        "ЦФО",
+        "ЦФО (Бюджет)",
         "МОЛ",
         "Статус",
         "Поставщик",
@@ -620,7 +618,7 @@ def build_request_xlsx(
             "Дата создания",
             "Инициатор",
             "Подразделение",
-            "ЦФО",
+            "ЦФО (Бюджет)",
             "МОЛ",
             "Статус",
         ]

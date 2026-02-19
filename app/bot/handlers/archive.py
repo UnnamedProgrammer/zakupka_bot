@@ -878,7 +878,7 @@ async def archive_edit_confirm(callback: CallbackQuery, state: FSMContext) -> No
     await state.set_state(ArchiveEdit.file)
     await callback.message.answer(
         "Скачайте файл, внесите изменения и отправьте обратно.\n"
-        "Можно менять только столбцы: Подразделение, ЦФО, МОЛ, Статус, "
+        "Можно менять только столбцы: Подразделение, ЦФО (Бюджет), МОЛ, Статус, "
         "Исполнитель, Поставщик, Срок поставки.\n"
         "Заголовки и ID менять нельзя. Формат даты: DD-MM-YYYY.",
     )
@@ -985,13 +985,13 @@ async def archive_edit_upload(message: Message, state: FSMContext) -> None:
                 )
                 continue
 
-            cfo_name = _normalize_text(values.get("ЦФО"))
+            cfo_name = _normalize_text(values.get("ЦФО (Бюджет)"))
             if not cfo_name:
-                errors.append(f"Строка {row_num}: не заполнено ЦФО.")
+                errors.append(f"Строка {row_num}: не заполнено ЦФО (Бюджет).")
                 continue
             cfo_id = cfo_map.get(cfo_name.casefold())
             if not cfo_id:
-                errors.append(f"Строка {row_num}: ЦФО \"{cfo_name}\" не найдено.")
+                errors.append(f"Строка {row_num}: ЦФО (Бюджет) \"{cfo_name}\" не найдено.")
                 continue
 
             status_name = _normalize_text(values.get("Статус"))

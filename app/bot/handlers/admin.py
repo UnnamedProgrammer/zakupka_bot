@@ -365,9 +365,9 @@ async def _show_cfos_list(
     if state:
         await state.update_data(admin_cfos_page=page)
     if not items:
-        text = "ЦФО: список пуст."
+        text = "ЦФО (Бюджет): список пуст."
     else:
-        text = "ЦФО"
+        text = "ЦФО (Бюджет)"
         if total_pages > 1:
             text = f"{text} (стр. {page + 1}/{total_pages})"
     await _edit_settings_screen(
@@ -618,7 +618,7 @@ async def cfo_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     await _edit_settings_screen(
         callback.bot,
         state,
-        "Введите название ЦФО",
+        "Введите название ЦФО (Бюджет)",
         reply_markup=None,
         fallback_message=callback.message,
     )
@@ -953,7 +953,7 @@ async def request_edit_field(callback: CallbackQuery, state: FSMContext) -> None
         await _edit_settings_screen(
             callback.bot,
             state,
-            "Выберите ЦФО",
+            "Выберите ЦФО (Бюджет)",
             reply_markup=cfo_keyboard(cfos),
             fallback_message=callback.message,
         )
@@ -1051,7 +1051,7 @@ async def request_edit_cfo(callback: CallbackQuery, state: FSMContext) -> None:
             await session.commit()
     await state.set_state(None)
     await _send_request_menu(callback.message, request_id, state=state)
-    await callback.answer("ЦФО обновлено")
+    await callback.answer("ЦФО (Бюджет) обновлено")
 
 
 @router.callback_query(AdminEditRequest.field_value, F.data.startswith("req_status:"))

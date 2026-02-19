@@ -143,7 +143,7 @@ def skip_keyboard(callback_data: str = "skip") -> InlineKeyboardMarkup:
 def settings_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🏢 Подразделения", callback_data="settings:departments")
-    builder.button(text="🏷️ ЦФО", callback_data="settings:cfos")
+    builder.button(text="🏷️ ЦФО (Бюджет)", callback_data="settings:cfos")
     builder.button(text="👥 Пользователи", callback_data="settings:users")
     builder.button(text="📝 Заявки", callback_data="settings:requests")
     builder.button(text="⬅️ В главное меню", callback_data="main_menu")
@@ -265,7 +265,7 @@ def request_fields_keyboard(request_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="👤 Инициатор", callback_data=f"req_edit_field:{request_id}:initiator")
     builder.button(text="🏢 Подразделение", callback_data=f"req_edit_field:{request_id}:department")
-    builder.button(text="🏷️ ЦФО", callback_data=f"req_edit_field:{request_id}:cfo")
+    builder.button(text="🏷️ ЦФО (Бюджет)", callback_data=f"req_edit_field:{request_id}:cfo")
     builder.button(text="👔 МОЛ", callback_data=f"req_edit_field:{request_id}:mol")
     builder.button(text="📌 Статус", callback_data=f"req_edit_field:{request_id}:status")
     builder.button(text="🧑‍🔧 Исполнитель", callback_data=f"req_edit_field:{request_id}:executor")

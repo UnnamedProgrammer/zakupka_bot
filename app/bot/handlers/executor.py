@@ -21,6 +21,8 @@ from app.bot.states import (
     ExportReportEdit,
 )
 from app.db.models import (
+    Approval,
+    ApprovalStatus,
     Attachment,
     Cfo,
     Comment,
@@ -34,13 +36,15 @@ from app.db.models import (
 )
 from app.db.session import SessionLocal
 from app.services.constants import (
+    APPROVAL_STATUS_PENDING,
+    APPROVAL_KIND_EXECUTOR_EXTRA,
     REQUEST_STATUS_APPROVED,
     REQUEST_STATUS_DONE,
     REQUEST_STATUS_IN_WORK,
     REQUEST_STATUS_REJECTED,
     REQUEST_STATUS_RECEIVED,
 )
-from app.services.attachments import build_photo_groups_from, fetch_request_media
+from app.services.attachments import build_attachment_groups_from, fetch_request_media
 from app.services.excel import (
     ReportParseError,
     build_employee_stats_xlsx,
@@ -521,30 +525,40 @@ async def _send_request_attachments_to_chat(
 ) -> None:
     if not attachments:
         return
-    photo_groups = build_photo_groups_from(request, items, attachments)
-    if photo_groups:
-        await bot.send_message(chat_id, "Вложения")
-        for title, photos in photo_groups:
-            await bot.send_message(chat_id, title)
-            for att in photos:
+    request_excel_name = f"request_{request.id}.xlsx"
+    skip_request_excel = request.description_method == "excel"
+    filtered_attachments: list[Attachment] = []
+    for att in attachments:
+        if att.file_type not in {"photo", "document"}:
+            continue
+        if (
+            att.file_type == "document"
+            and skip_request_excel
+            and att.file_name == request_excel_name
+        ):
+            continue
+        filtered_attachments.append(att)
+
+    attachment_groups = build_attachment_groups_from(request, items, filtered_attachments)
+    if attachment_groups:
+        await bot.send_message(chat_id, "Вложения по товарам:")
+    for title, item_attachments in attachment_groups:
+        await bot.send_message(chat_id, title)
+        for att in item_attachments:
+            if att.file_type == "photo":
                 if att.file_path:
                     await bot.send_photo(chat_id, FSInputFile(att.file_path))
                 elif att.file_id:
                     await bot.send_photo(chat_id, att.file_id)
-    request_excel_name = f"request_{request.id}.xlsx"
-    skip_request_excel = request.description_method == "excel"
-    for att in attachments:
-        if att.file_type != "document":
-            continue
-        if skip_request_excel and att.file_name == request_excel_name:
-            continue
-        if att.file_id:
-            await bot.send_document(chat_id, att.file_id)
-        elif att.file_path:
-            await bot.send_document(
-                chat_id,
-                FSInputFile(att.file_path, filename=att.file_name or None),
-            )
+                continue
+            if att.file_type == "document":
+                if att.file_id:
+                    await bot.send_document(chat_id, att.file_id)
+                elif att.file_path:
+                    await bot.send_document(
+                        chat_id,
+                        FSInputFile(att.file_path, filename=att.file_name or None),
+                    )
 
 
 def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
@@ -654,6 +668,46 @@ async def assign_executor(callback: CallbackQuery) -> None:
         if not request or not executor:
             await callback.answer("Заявка не найдена")
             return
+        if request.executor_id:
+            assigned_executor = await session.get(User, request.executor_id)
+            assigned_name = (
+                assigned_executor.full_name or assigned_executor.tg_username
+                if assigned_executor
+                else None
+            ) or f"ID {request.executor_id}"
+            try:
+                builder = InlineKeyboardBuilder()
+                builder.row(
+                    InlineKeyboardButton(
+                        text="⬅️ В главное меню",
+                        callback_data="main_menu",
+                    )
+                )
+                await callback.message.edit_text(
+                    f"Исполнитель уже назначен: {assigned_name}.",
+                    reply_markup=builder.as_markup(),
+                )
+            except Exception:
+                pass
+            await callback.answer("Исполнитель уже назначен")
+            return
+        if request.status and request.status.code == REQUEST_STATUS_REJECTED:
+            await callback.answer("Заявка отклонена")
+            return
+        pending_status_id = await session.scalar(
+            select(ApprovalStatus.id).where(ApprovalStatus.code == APPROVAL_STATUS_PENDING)
+        )
+        if pending_status_id:
+            pending_extra_id = await session.scalar(
+                select(Approval.id).where(
+                    Approval.request_id == request.id,
+                    Approval.status_id == pending_status_id,
+                    Approval.kind == APPROVAL_KIND_EXECUTOR_EXTRA,
+                )
+            )
+            if pending_extra_id:
+                await callback.answer("Ожидается дополнительное согласование")
+                return
         override_executor = await _resolve_override_executor(session)
         target_executor = override_executor or executor
         request.executor_id = target_executor.id
@@ -666,32 +720,13 @@ async def assign_executor(callback: CallbackQuery) -> None:
             reply_markup=_executor_keyboard_for_request(request),
         )
         items, attachments = await fetch_request_media(session, request.id)
-        skip_request_excel = request.description_method == "excel"
-        request_excel_name = f"request_{request.id}.xlsx"
-        photo_groups = build_photo_groups_from(request, items, attachments)
-        if photo_groups:
-            await callback.bot.send_message(target_executor.tg_id, "Заявка")
-            for title, photos in photo_groups:
-                await callback.bot.send_message(target_executor.tg_id, title)
-                for att in photos:
-                    if att.file_path:
-                        await callback.bot.send_photo(
-                            target_executor.tg_id, FSInputFile(att.file_path)
-                        )
-                    elif att.file_id:
-                        await callback.bot.send_photo(target_executor.tg_id, att.file_id)
-        for att in attachments:
-            if att.file_type != "document":
-                continue
-            if skip_request_excel and att.file_name == request_excel_name:
-                continue
-            if att.file_id:
-                await callback.bot.send_document(target_executor.tg_id, att.file_id)
-            elif att.file_path:
-                await callback.bot.send_document(
-                    target_executor.tg_id,
-                    FSInputFile(att.file_path, filename=att.file_name or None),
-                )
+        await _send_request_attachments_to_chat(
+            callback.bot,
+            target_executor.tg_id,
+            request,
+            items,
+            attachments,
+        )
         await send_to_user(
             callback.bot,
             request.initiator,
@@ -700,6 +735,26 @@ async def assign_executor(callback: CallbackQuery) -> None:
                 f"{target_executor.full_name or target_executor.tg_username}."
             ),
         )
+        assigned_name = (
+            target_executor.full_name or target_executor.tg_username or f"ID {target_executor.id}"
+        )
+        try:
+            builder = InlineKeyboardBuilder()
+            builder.row(
+                InlineKeyboardButton(
+                    text="⬅️ В главное меню",
+                    callback_data="main_menu",
+                )
+            )
+            await callback.message.edit_text(
+                (
+                    f"Исполнитель назначен: {assigned_name}.\n"
+                    f"Заявка №{request.id} отправлена исполнителю."
+                ),
+                reply_markup=builder.as_markup(),
+            )
+        except Exception:
+            pass
     await callback.answer("Исполнитель назначен")
 
 
@@ -801,34 +856,46 @@ async def executor_comment(message: Message, state: FSMContext) -> None:
         )
         await session.commit()
 
+        notify_result = await session.execute(
+            select(Request)
+            .where(Request.id == request.id)
+            .options(selectinload(Request.initiator), selectinload(Request.status))
+        )
+        notify_request = notify_result.scalar_one_or_none()
+        notify_initiator = (
+            notify_request.initiator
+            if notify_request and notify_request.initiator
+            else request.initiator
+        )
+
         if status_code:
-            updated = await session.get(
-                Request,
-                request.id,
-                options=[selectinload(Request.initiator), selectinload(Request.status)],
+            status_name = (
+                notify_request.status.name
+                if notify_request and notify_request.status
+                else status_code
             )
-            status_name = updated.status.name if updated and updated.status else status_code
+            # Keep Telegram message safely below limits.
+            notify_comment = formatted_comment
+            if len(notify_comment) > 1500:
+                notify_comment = notify_comment[:1497].rstrip() + "..."
             await send_to_user(
                 message.bot,
-                updated.initiator if updated else request.initiator,
+                notify_initiator,
                 (
                     f"Изменен статус вашей заявки №{request.id}: {status_name}. "
-                    f"Комментарий: {formatted_comment}"
+                    f"Комментарий: {notify_comment}"
                 ),
             )
         else:
-            updated = await session.get(
-                Request, request.id, options=[selectinload(Request.initiator)]
-            )
             await send_to_user(
                 message.bot,
-                updated.initiator if updated else request.initiator,
+                notify_initiator,
                 f"Комментарий к заявке №{request.id}: {formatted_comment}",
             )
         if status_code == REQUEST_STATUS_DONE:
             await send_to_user(
                 message.bot,
-                request.initiator,
+                notify_initiator,
                 "Если ТМЦ получено, подтвердите:",
                 reply_markup=receive_tmc_keyboard(request.id),
             )
@@ -1330,7 +1397,7 @@ async def export_edit_confirm(callback: CallbackQuery, state: FSMContext) -> Non
     await state.update_data(report_type=report_type)
     await callback.message.answer(
         "Скачайте файл, внесите изменения и отправьте обратно.\n"
-        "Можно менять только столбцы: Подразделение, ЦФО, МОЛ, Статус, "
+        "Можно менять только столбцы: Подразделение, ЦФО (Бюджет), МОЛ, Статус, "
         "Исполнитель, Поставщик, Срок поставки.\n"
         "Заголовки и ID менять нельзя. Формат даты: DD-MM-YYYY.",
     )
@@ -1434,13 +1501,13 @@ async def export_edit_upload(message: Message, state: FSMContext) -> None:
                 )
                 continue
 
-            cfo_name = _normalize_text(values.get("ЦФО"))
+            cfo_name = _normalize_text(values.get("ЦФО (Бюджет)"))
             if not cfo_name:
-                errors.append(f"Строка {row_num}: не заполнено ЦФО.")
+                errors.append(f"Строка {row_num}: не заполнено ЦФО (Бюджет).")
                 continue
             cfo_id = cfo_map.get(cfo_name.casefold())
             if not cfo_id:
-                errors.append(f"Строка {row_num}: ЦФО \"{cfo_name}\" не найдено.")
+                errors.append(f"Строка {row_num}: ЦФО (Бюджет) \"{cfo_name}\" не найдено.")
                 continue
 
             status_name = _normalize_text(values.get("Статус"))

@@ -8,7 +8,7 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.bot.keyboards import approval_action_keyboard
@@ -26,12 +26,10 @@ from app.db.models import (
     RequestCategory,
     RequestItem,
     RequestStatus,
-    Role,
     User,
-    user_roles,
 )
 from app.db.session import SessionLocal
-from app.services.attachments import build_photo_groups_from, fetch_request_media
+from app.services.attachments import build_attachment_groups_from, fetch_request_media
 from app.services.constants import APPROVAL_STATUS_PENDING, REQUEST_STATUS_PENDING
 from app.services.excel import (
     TemplateParseError,
@@ -226,18 +224,6 @@ async def _get_or_create_reference(
     return obj.id
 
 
-async def _fetch_approvers(session) -> list[tuple[int, str]]:
-    rows = await session.execute(
-        select(User.id, User.full_name)
-        .outerjoin(user_roles, user_roles.c.user_id == User.id)
-        .outerjoin(Role, Role.id == user_roles.c.role_id)
-        .where(or_(Role.code == "approver", User.is_default_approver.is_(True)))
-        .distinct()
-        .order_by(User.full_name, User.id)
-    )
-    return [(row[0], row[1]) for row in rows.all()]
-
-
 async def _send_request_with_attachments(
     bot,
     request: Request,
@@ -248,26 +234,27 @@ async def _send_request_with_attachments(
     await send_to_user(bot, user, format_request_summary(request))
     if not user.tg_id:
         return
-    photo_groups = build_photo_groups_from(request, items, attachments)
-    if photo_groups:
-        await bot.send_message(user.tg_id, "Заявка")
-        for title, photos in photo_groups:
-            await bot.send_message(user.tg_id, title)
-            for att in photos:
+    attachment_groups = build_attachment_groups_from(request, items, attachments)
+    if attachment_groups:
+        await bot.send_message(user.tg_id, "Вложения по товарам:")
+    for title, item_attachments in attachment_groups:
+        await bot.send_message(user.tg_id, title)
+        for att in item_attachments:
+            if att.file_type == "photo":
                 if att.file_path:
                     await bot.send_photo(user.tg_id, FSInputFile(att.file_path))
                 elif att.file_id:
                     await bot.send_photo(user.tg_id, att.file_id)
-    for att in attachments:
-        if att.file_type != "document":
-            continue
-        if att.file_id:
-            await bot.send_document(user.tg_id, att.file_id)
-        elif att.file_path:
-            await bot.send_document(
-                user.tg_id,
-                FSInputFile(att.file_path, filename=att.file_name or None),
-            )
+                continue
+            if att.file_type != "document":
+                continue
+            if att.file_id:
+                await bot.send_document(user.tg_id, att.file_id)
+            elif att.file_path:
+                await bot.send_document(
+                    user.tg_id,
+                    FSInputFile(att.file_path, filename=att.file_name or None),
+                )
 
 
 async def _send_request_with_attachments_to_chat(
@@ -278,26 +265,27 @@ async def _send_request_with_attachments_to_chat(
     attachments: list[Attachment],
 ) -> None:
     await bot.send_message(chat_id, format_request_summary(request))
-    photo_groups = build_photo_groups_from(request, items, attachments)
-    if photo_groups:
-        await bot.send_message(chat_id, "Заявка")
-        for title, photos in photo_groups:
-            await bot.send_message(chat_id, title)
-            for att in photos:
+    attachment_groups = build_attachment_groups_from(request, items, attachments)
+    if attachment_groups:
+        await bot.send_message(chat_id, "Вложения по товарам:")
+    for title, item_attachments in attachment_groups:
+        await bot.send_message(chat_id, title)
+        for att in item_attachments:
+            if att.file_type == "photo":
                 if att.file_path:
                     await bot.send_photo(chat_id, FSInputFile(att.file_path))
                 elif att.file_id:
                     await bot.send_photo(chat_id, att.file_id)
-    for att in attachments:
-        if att.file_type != "document":
-            continue
-        if att.file_id:
-            await bot.send_document(chat_id, att.file_id)
-        elif att.file_path:
-            await bot.send_document(
-                chat_id,
-                FSInputFile(att.file_path, filename=att.file_name or None),
-            )
+                continue
+            if att.file_type != "document":
+                continue
+            if att.file_id:
+                await bot.send_document(chat_id, att.file_id)
+            elif att.file_path:
+                await bot.send_document(
+                    chat_id,
+                    FSInputFile(att.file_path, filename=att.file_name or None),
+                )
 
 
 async def _send_approval_to_chat(
@@ -374,7 +362,7 @@ def _request_menu_text(data: dict, error: str | None = None) -> str:
                 ),
                 "Товары:",
                 _items_overview(data.get("items") or []),
-                f"Согласующий: {_display_value(data.get('approver_name'), default='не выбран')}",
+                "Согласующий: автоматически (Default Approver)",
             ]
         )
         lines.append("")
@@ -385,7 +373,6 @@ def _request_menu_text(data: dict, error: str | None = None) -> str:
             lines.append(f"Файл: {file_name}")
         else:
             lines.append("Файл: не загружен")
-        lines.append("Отправьте Excel файл по шаблону.")
     else:
         lines.append("Выберите способ создания заявки.")
 
@@ -398,6 +385,12 @@ def _request_menu_text(data: dict, error: str | None = None) -> str:
 def _request_menu_keyboard(data: dict):
     method = data.get("request_method")
     builder = InlineKeyboardBuilder()
+
+    if method == "excel":
+        builder.button(text="❌ Отмена", callback_data="req_cancel")
+        builder.adjust(1)
+        return builder.as_markup()
+
     builder.button(text="✍️ Вручную", callback_data="req_method:manual")
     builder.button(text="📄 Excel", callback_data="req_method:excel")
 
@@ -408,14 +401,9 @@ def _request_menu_keyboard(data: dict):
         builder.button(text="💰 Макс. цена", callback_data="req_field:contract_max_price")
         builder.button(text="📑 БДДС", callback_data="req_field:bdds_article_category")
         builder.button(text="🧾 Товары", callback_data="req_items:menu")
-        builder.button(text="✅ Согласующий", callback_data="req_field:approver")
         builder.button(text="🚀 Отправить", callback_data="req_submit")
         builder.button(text="❌ Отмена", callback_data="req_cancel")
-        builder.adjust(2, 2, 2, 2, 1, 2)
-    elif method == "excel":
-        builder.button(text="📄 Загрузить файл", callback_data="req_excel:upload")
-        builder.button(text="❌ Отмена", callback_data="req_cancel")
-        builder.adjust(2, 1)
+        builder.adjust(2, 2, 2, 2, 2)
     else:
         builder.button(text="❌ Отмена", callback_data="req_cancel")
         builder.adjust(2, 1)
@@ -440,12 +428,30 @@ def _cfo_keyboard(items: list[tuple[int, str]]):
     return builder.as_markup()
 
 
-def _approver_keyboard(items: list[tuple[int, str]], back_callback: str = "req_menu"):
+def _manual_departments_keyboard(items: list[tuple[int, str]]):
     builder = InlineKeyboardBuilder()
-    for user_id, name in items:
-        builder.button(text=f"👤 {name}", callback_data=f"req_approver:{user_id}")
+    for dep_id, name in items:
+        builder.button(text=f"🏢 {name}", callback_data=f"req_department:{dep_id}")
     builder.adjust(1)
-    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback))
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="req_cancel"))
+    return builder.as_markup()
+
+
+def _manual_cfo_keyboard(items: list[tuple[int, str]]):
+    builder = InlineKeyboardBuilder()
+    for cfo_id, name in items:
+        builder.button(text=f"🏷️ {name}", callback_data=f"req_cfo:{cfo_id}")
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="req_cancel"))
+    return builder.as_markup()
+
+
+def _manual_item_more_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Добавить товар", callback_data="item_more:yes")
+    builder.button(text="🚀 Отправить заявку", callback_data="item_more:no")
+    builder.adjust(2)
+    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="req_cancel"))
     return builder.as_markup()
 
 
@@ -486,8 +492,8 @@ def _input_prompt_keyboard(clear_callback: str, back_callback: str):
 def _attachments_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Готово", callback_data="req_item_attach_done")
+    builder.button(text="⏭️ Пропустить", callback_data="req_item_attach_skip")
     builder.button(text="🧹 Очистить", callback_data="req_item_attach_clear")
-    builder.button(text="⬅️ Назад", callback_data="req_item_attach_back")
     builder.adjust(2, 1)
     return builder.as_markup()
 
@@ -823,6 +829,7 @@ async def _show_attachment_prompt(
     links_count = _count_links(item.get("link"))
     text = (
         "Отправьте фото, файл или ссылку на товар.\n"
+        "Или нажмите «Готово» / «Пропустить».\n"
         f"Ссылки: {links_count}\n"
         f"Вложения: {len(attachments)}"
     )
@@ -843,8 +850,6 @@ def _validate_manual_request(data: dict) -> list[str]:
         errors.append("ЦФО")
     if not _normalize_text(data.get("mol_full_name")):
         errors.append("МОЛ")
-    if not data.get("approver_id"):
-        errors.append("согласующий")
     items = data.get("items") or []
     if not items:
         errors.append("хотя бы один товар")
@@ -862,7 +867,6 @@ def _validate_manual_request(data: dict) -> list[str]:
 async def _create_request(
     bot,
     data: dict,
-    selected_approver_id: int,
     tg_user,
     reply_message: Message,
 ) -> Request | None:
@@ -984,34 +988,22 @@ async def _create_request(
                 )
             )
 
-        approval_status_id = await _get_status_id(
-            session, ApprovalStatus, APPROVAL_STATUS_PENDING
-        )
-        ordered_approvers: list[User] = []
-        seen_ids: set[int] = set()
-
-        def _add_approver(user: User | None) -> None:
-            if not user or user.id in seen_ids:
-                return
-            seen_ids.add(user.id)
-            ordered_approvers.append(user)
-
-        default_approvers = (
+        ordered_approvers = (
             await session.execute(
                 select(User)
                 .where(User.is_default_approver.is_(True))
-                .order_by(User.full_name)
+                .order_by(User.full_name, User.id)
             )
         ).scalars().all()
-        for user in default_approvers:
-            _add_approver(user)
+        if not ordered_approvers:
+            await reply_message.answer(
+                "Не найден пользователь с флагом Default Approver. Обратитесь к администратору."
+            )
+            return None
 
-        selected = await session.get(User, selected_approver_id)
-        if not selected or selected.is_default_approver:
-            # Только главные согласующие получают такие заявки.
-            pass
-        else:
-            _add_approver(selected)
+        approval_status_id = await _get_status_id(
+            session, ApprovalStatus, APPROVAL_STATUS_PENDING
+        )
 
         approvals = []
         for user in ordered_approvers:
@@ -1259,6 +1251,23 @@ async def template_cfo_pick(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(StateFilter(RequestCreate), F.data == "req_menu")
 async def request_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if data.get("manual_wizard") and data.get("request_method") == "manual":
+        await state.set_state(RequestCreate.menu)
+        async with SessionLocal() as session:
+            dep_rows = await session.execute(
+                select(Department.id, Department.name).order_by(Department.name)
+            )
+            deps = dep_rows.all()
+        if not deps:
+            await callback.answer("Подразделения не найдены")
+            return
+        await callback.message.answer(
+            "🏢 Шаг 1/6. Выберите подразделение:",
+            reply_markup=_manual_departments_keyboard(deps),
+        )
+        await callback.answer()
+        return
     await state.set_state(RequestCreate.menu)
     await _show_request_menu(callback.bot, state, fallback_message=callback.message)
     await callback.answer()
@@ -1289,19 +1298,42 @@ async def request_set_method(callback: CallbackQuery, state: FSMContext) -> None
         "contract_max_price": None,
         "bdds_article_category": None,
         "items": [],
-        "approver_id": None,
-        "approver_name": None,
         "excel_groups": None,
         "excel_group_index": None,
         "excel_file_path": None,
         "excel_file_name": None,
+        "current_item_index": None,
+        "input_target": None,
+        "manual_wizard": method == "manual",
     }
     await state.update_data(request_method=method, description_method=method, **reset_payload)
     if method == "excel":
         await state.set_state(RequestCreate.excel_file)
+        await _show_request_menu(callback.bot, state, fallback_message=callback.message)
+        await callback.message.answer("📄 Отправьте Excel файл по шаблону.")
+        await callback.answer()
+        return
     else:
         await state.set_state(RequestCreate.menu)
-    await _show_request_menu(callback.bot, state, fallback_message=callback.message)
+        async with SessionLocal() as session:
+            dep_rows = await session.execute(
+                select(Department.id, Department.name).order_by(Department.name)
+            )
+            deps = dep_rows.all()
+        if not deps:
+            await callback.answer("Подразделения не найдены")
+            return
+        await _edit_request_message(
+            callback.bot,
+            state,
+            "✍️ Ручной режим заполнения запущен.",
+            reply_markup=None,
+            fallback_message=callback.message,
+        )
+        await callback.message.answer(
+            "🏢 Шаг 1/6. Выберите подразделение:",
+            reply_markup=_manual_departments_keyboard(deps),
+        )
     await callback.answer()
 
 
@@ -1382,7 +1414,7 @@ async def request_excel_upload(message: Message, state: FSMContext) -> None:
                 message.bot,
                 state,
                 error=(
-                    "Инициатор из ячейки G2 не найден в базе пользователей. "
+                    "Инициатор из ячейки E2 не найден в базе пользователей. "
                     "Исправьте ФИО и загрузите файл заново."
                 ),
                 fallback_message=message,
@@ -1411,17 +1443,33 @@ async def request_excel_upload(message: Message, state: FSMContext) -> None:
         initiator = initiator_rows[0]
 
         dep_rows = await session.execute(select(Department.id, Department.name))
-        department_map = {
-            _normalize_key(name): (dep_id, name) for dep_id, name in dep_rows.all()
-        }
+        dep_map: dict[str, list[tuple[int, str]]] = {}
+        for dep_id, dep_name in dep_rows.all():
+            dep_map.setdefault(_normalize_key(dep_name), []).append((dep_id, dep_name))
+        if not dep_map:
+            await state.set_state(RequestCreate.excel_file)
+            await _show_request_menu(
+                message.bot,
+                state,
+                error="В базе нет подразделений. Загрузка заявки невозможна.",
+                fallback_message=message,
+            )
+            try:
+                Path(file_path).unlink()
+            except FileNotFoundError:
+                pass
+            return
+
         cfo_rows = await session.execute(select(Cfo.id, Cfo.name))
-        cfo_map = {_normalize_key(name): (cfo_id, name) for cfo_id, name in cfo_rows.all()}
+        cfo_map: dict[str, list[tuple[int, str]]] = {}
+        for cfo_id, cfo_name in cfo_rows.all():
+            cfo_map.setdefault(_normalize_key(cfo_name), []).append((cfo_id, cfo_name))
         if not cfo_map:
             await state.set_state(RequestCreate.excel_file)
             await _show_request_menu(
                 message.bot,
                 state,
-                error="В базе нет ЦФО. Загрузка заявки невозможна.",
+                error="В базе нет ЦФО (Бюджет). Загрузка заявки невозможна.",
                 fallback_message=message,
             )
             try:
@@ -1432,9 +1480,27 @@ async def request_excel_upload(message: Message, state: FSMContext) -> None:
 
         excel_groups = []
         for group in parsed["groups"]:
-            dept_key = _normalize_key(group["department_name"])
-            dept = department_map.get(dept_key)
-            if not dept:
+            dep_name_from_file = _normalize_text(group.get("department_name"))
+            if not dep_name_from_file:
+                await state.set_state(RequestCreate.excel_file)
+                await _show_request_menu(
+                    message.bot,
+                    state,
+                    error=(
+                        "В файле не указано подразделение в ячейке E4. "
+                        "Исправьте файл и загрузите заново."
+                    ),
+                    fallback_message=message,
+                )
+                try:
+                    Path(file_path).unlink()
+                except FileNotFoundError:
+                    pass
+                return
+
+            dep_key = _normalize_key(dep_name_from_file)
+            dep_candidates = dep_map.get(dep_key) or []
+            if not dep_candidates:
                 await state.set_state(RequestCreate.excel_file)
                 await _show_request_menu(
                     message.bot,
@@ -1450,15 +1516,33 @@ async def request_excel_upload(message: Message, state: FSMContext) -> None:
                 except FileNotFoundError:
                     pass
                 return
-            cfo_key = _normalize_key(group["cfo_name"])
-            cfo = cfo_map.get(cfo_key)
-            if not cfo:
+            if len(dep_candidates) > 1:
+                dep_list = ", ".join(str(dep_id) for dep_id, _ in dep_candidates)
                 await state.set_state(RequestCreate.excel_file)
                 await _show_request_menu(
                     message.bot,
                     state,
                     error=(
-                        f"ЦФО «{group['cfo_name']}» не найдено в базе. "
+                        f"Подразделение «{group['department_name']}» неоднозначно (ID: {dep_list}). "
+                        "Уточните справочник подразделений."
+                    ),
+                    fallback_message=message,
+                )
+                try:
+                    Path(file_path).unlink()
+                except FileNotFoundError:
+                    pass
+                return
+
+            cfo_key = _normalize_key(group["cfo_name"])
+            cfo_candidates = cfo_map.get(cfo_key) or []
+            if not cfo_candidates:
+                await state.set_state(RequestCreate.excel_file)
+                await _show_request_menu(
+                    message.bot,
+                    state,
+                    error=(
+                        f"ЦФО (Бюджет) «{group['cfo_name']}» не найдено в базе. "
                         "Исправьте файл и загрузите заново."
                     ),
                     fallback_message=message,
@@ -1468,12 +1552,32 @@ async def request_excel_upload(message: Message, state: FSMContext) -> None:
                 except FileNotFoundError:
                     pass
                 return
+            if len(cfo_candidates) > 1:
+                cfo_list = ", ".join(str(cfo_id) for cfo_id, _ in cfo_candidates)
+                await state.set_state(RequestCreate.excel_file)
+                await _show_request_menu(
+                    message.bot,
+                    state,
+                    error=(
+                        f"ЦФО (Бюджет) «{group['cfo_name']}» неоднозначно (ID: {cfo_list}). "
+                        "Уточните справочник ЦФО."
+                    ),
+                    fallback_message=message,
+                )
+                try:
+                    Path(file_path).unlink()
+                except FileNotFoundError:
+                    pass
+                return
+
+            dep_id, dep_name = dep_candidates[0]
+            cfo_id, cfo_name = cfo_candidates[0]
             excel_groups.append(
                 {
-                    "department_id": dept[0],
-                    "department_name": dept[1],
-                    "cfo_id": cfo[0],
-                    "cfo_name": cfo[1],
+                    "department_id": dep_id,
+                    "department_name": dep_name,
+                    "cfo_id": cfo_id,
+                    "cfo_name": cfo_name,
                     "mol_full_name": group["mol_full_name"],
                     "contract_max_price": group.get("contract_max_price"),
                     "bdds_article_category": group.get("bdds_article_category"),
@@ -1506,14 +1610,15 @@ async def request_excel_upload(message: Message, state: FSMContext) -> None:
         excel_groups=excel_groups,
         excel_group_index=0,
     )
-    await _show_excel_approver_menu(message, state)
+    await _show_excel_approver_menu(message, state, message.from_user)
 
 
-async def _show_excel_approver_menu(message: Message, state: FSMContext) -> None:
+async def _show_excel_approver_menu(message: Message, state: FSMContext, tg_user) -> None:
     data = await state.get_data()
     groups = data.get("excel_groups") or []
     index = data.get("excel_group_index", 0)
-    if index >= len(groups):
+    total = len(groups)
+    if index >= total:
         await _edit_request_message(
             message.bot,
             state,
@@ -1523,40 +1628,56 @@ async def _show_excel_approver_menu(message: Message, state: FSMContext) -> None
         )
         await state.clear()
         return
-    group = groups[index]
-    await state.update_data(
-        department_id=group["department_id"],
-        department_name=group["department_name"],
-        cfo_id=group["cfo_id"],
-        cfo_name=group["cfo_name"],
-        mol_full_name=group["mol_full_name"],
-        contract_max_price=group.get("contract_max_price"),
-        bdds_article_category=group.get("bdds_article_category"),
-        items=group["items"],
-        approver_id=None,
-        approver_name=None,
-    )
-    async with SessionLocal() as session:
-        approvers = await _fetch_approvers(session)
-    text = (
-        f"Заявка из файла ({index + 1}/{len(groups)})\n"
-        f"Подразделение: {_display_value(group['department_name'])}\n"
-        f"ЦФО: {_display_value(group['cfo_name'])}\n"
-        f"МОЛ: {_display_value(group['mol_full_name'], default='не указан')}\n"
-        "Макс. цена договора (тыс.руб.): "
-        f"{_display_value(group.get('contract_max_price'), default='не задана')}\n"
-        "БДДС (Статья - Категория): "
-        f"{_display_value(group.get('bdds_article_category'), default='не задано')}\n"
-        f"Товары: {len(group.get('items') or [])}\n\n"
-        "Выберите согласующего руководителя."
-    )
+
+    while index < total:
+        group = groups[index]
+        text = (
+            f"⏳ Создаю заявки из файла: {index + 1}/{total}\n"
+            f"Подразделение: {_display_value(group['department_name'])}\n"
+            f"ЦФО: {_display_value(group['cfo_name'])}\n"
+            f"МОЛ: {_display_value(group['mol_full_name'], default='не указан')}\n"
+            f"Товары: {len(group.get('items') or [])}"
+        )
+        await _edit_request_message(
+            message.bot,
+            state,
+            text,
+            reply_markup=None,
+            fallback_message=message,
+        )
+        await state.update_data(
+            department_id=group["department_id"],
+            department_name=group["department_name"],
+            cfo_id=group["cfo_id"],
+            cfo_name=group["cfo_name"],
+            mol_full_name=group["mol_full_name"],
+            contract_max_price=group.get("contract_max_price"),
+            bdds_article_category=group.get("bdds_article_category"),
+            items=group["items"],
+            excel_group_index=index,
+        )
+        payload = await state.get_data()
+        created = await _create_request(message.bot, payload, tg_user, message)
+        if not created:
+            await state.set_state(RequestCreate.menu)
+            await _show_request_menu(
+                message.bot,
+                state,
+                error="Загрузка заявок остановлена. Исправьте данные и загрузите файл заново.",
+                fallback_message=message,
+            )
+            return
+        index += 1
+        await state.update_data(excel_group_index=index)
+
     await _edit_request_message(
         message.bot,
         state,
-        text,
-        _approver_keyboard(approvers, back_callback="req_cancel"),
+        "Загрузка заявок завершена.",
+        reply_markup=None,
         fallback_message=message,
     )
+    await state.clear()
 
 
 @router.callback_query(StateFilter(RequestCreate), F.data == "req_field:department")
@@ -1569,7 +1690,7 @@ async def request_department_menu(callback: CallbackQuery, state: FSMContext) ->
     await _edit_request_message(
         callback.bot,
         state,
-        "Выберите подразделение",
+        "🏢 Выберите подразделение",
         _departments_keyboard(deps),
         fallback_message=callback.message,
     )
@@ -1585,6 +1706,20 @@ async def request_department_pick(callback: CallbackQuery, state: FSMContext) ->
         await callback.answer("Подразделение не найдено.")
         return
     await state.update_data(department_id=dep.id, department_name=dep.name)
+    data = await state.get_data()
+    if data.get("manual_wizard") and data.get("request_method") == "manual":
+        async with SessionLocal() as session:
+            cfo_rows = await session.execute(select(Cfo.id, Cfo.name).order_by(Cfo.name))
+            cfos = cfo_rows.all()
+        if not cfos:
+            await callback.answer("ЦФО не найдены")
+            return
+        await callback.message.answer(
+            f"🏢 Подразделение: {_display_value(dep.name)}\n🏷️ Шаг 2/6. Выберите ЦФО:",
+            reply_markup=_manual_cfo_keyboard(cfos),
+        )
+        await callback.answer()
+        return
     await _show_request_menu(callback.bot, state, fallback_message=callback.message)
     await callback.answer()
 
@@ -1597,7 +1732,7 @@ async def request_cfo_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await _edit_request_message(
         callback.bot,
         state,
-        "Выберите ЦФО",
+        "🏷️ Выберите ЦФО",
         _cfo_keyboard(cfos),
         fallback_message=callback.message,
     )
@@ -1613,6 +1748,15 @@ async def request_cfo_pick(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("ЦФО не найдено.")
         return
     await state.update_data(cfo_id=cfo.id, cfo_name=cfo.name)
+    data = await state.get_data()
+    if data.get("manual_wizard") and data.get("request_method") == "manual":
+        await state.set_state(RequestCreate.text_input)
+        await state.update_data(input_target="mol_full_name")
+        await callback.message.answer(
+            f"🏷️ ЦФО: {_display_value(cfo.name)}\n👤 Шаг 3/6. Введите ФИО МОЛ."
+        )
+        await callback.answer()
+        return
     await _show_request_menu(callback.bot, state, fallback_message=callback.message)
     await callback.answer()
 
@@ -1624,7 +1768,7 @@ async def request_mol_input(callback: CallbackQuery, state: FSMContext) -> None:
     await _show_input_prompt(
         callback.bot,
         state,
-        "Введите ФИО материально ответственного лица (МОЛ).",
+        "👤 Введите ФИО материально ответственного лица (МОЛ).",
         "req_input_clear:mol_full_name",
         "req_menu",
         fallback_message=callback.message,
@@ -1640,7 +1784,7 @@ async def request_contract_max_price_input(callback: CallbackQuery, state: FSMCo
         callback.bot,
         state,
         (
-            "Введите начальную (максимальную) цену договора согласно Плану закупок "
+            "💰 Введите начальную (максимальную) цену договора согласно Плану закупок "
             "с НДС (в тыс.руб.)."
         ),
         "req_input_clear:contract_max_price",
@@ -1658,7 +1802,7 @@ async def request_bdds_article_category_input(callback: CallbackQuery, state: FS
         callback.bot,
         state,
         (
-            "Введите значение «В соответствии с управлением холдингом 1С» "
+            "📑 Введите значение «В соответствии с управлением холдингом 1С» "
             "(БДДС: Статья ДДС - Товарная категория)."
         ),
         "req_input_clear:bdds_article_category",
@@ -1670,46 +1814,32 @@ async def request_bdds_article_category_input(callback: CallbackQuery, state: FS
 
 @router.callback_query(StateFilter(RequestCreate), F.data == "req_field:approver")
 async def request_approver_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    async with SessionLocal() as session:
-        approvers = await _fetch_approvers(session)
-    await _edit_request_message(
+    await _show_request_menu(
         callback.bot,
         state,
-        "Выберите согласующего руководителя",
-        _approver_keyboard(approvers),
+        error="Согласующий назначается автоматически (Default Approver).",
         fallback_message=callback.message,
     )
-    await callback.answer()
+    await callback.answer("Назначается автоматически.")
 
 
 @router.callback_query(StateFilter(RequestCreate), F.data.startswith("req_approver:"))
 async def request_approver_pick(callback: CallbackQuery, state: FSMContext) -> None:
-    approver_id = int(callback.data.split(":")[1])
     data = await state.get_data()
     method = data.get("request_method")
-    async with SessionLocal() as session:
-        user = await session.get(User, approver_id)
-    if not user:
-        await callback.answer("Согласующий не найден.")
-        return
 
     if method == "excel":
-        request = await _create_request(
-            callback.bot, data, approver_id, callback.from_user, callback.message
-        )
-        if not request:
-            await callback.answer()
-            return
-        next_index = data.get("excel_group_index", 0) + 1
-        await state.update_data(excel_group_index=next_index)
-        await _show_excel_approver_menu(callback.message, state)
+        await _show_excel_approver_menu(callback.message, state, callback.from_user)
         await callback.answer()
         return
 
-    approver_name = _normalize_text(user.full_name) or _normalize_text(user.tg_username)
-    await state.update_data(approver_id=user.id, approver_name=approver_name)
-    await _show_request_menu(callback.bot, state, fallback_message=callback.message)
-    await callback.answer()
+    await _show_request_menu(
+        callback.bot,
+        state,
+        error="Согласующий назначается автоматически (Default Approver).",
+        fallback_message=callback.message,
+    )
+    await callback.answer("Назначается автоматически.")
 
 
 @router.callback_query(StateFilter(RequestCreate), F.data == "req_items:menu")
@@ -1739,7 +1869,7 @@ async def request_item_add(callback: CallbackQuery, state: FSMContext) -> None:
     await _show_input_prompt(
         callback.bot,
         state,
-        "Введите наименование товара.",
+        "🧾 Введите наименование товара.",
         "req_input_clear:item_name",
         "req_items:menu",
         fallback_message=callback.message,
@@ -1779,15 +1909,15 @@ async def request_item_field(callback: CallbackQuery, state: FSMContext) -> None
     await state.set_state(RequestCreate.text_input)
     await state.update_data(current_item_index=item_index, input_target=f"item_{field}")
     prompts = {
-        "name": "Введите наименование товара.",
-        "specs": "Введите технические характеристики.",
-        "brand": "Введите марку устройства или аналог.",
-        "qty": "Введите количество.",
-        "unit": "Введите единицу измерения.",
-        "link": "Введите ссылку на товар (можно несколько строк).",
-        "note": "Введите примечание (при необходимости).",
+        "name": "🧾 Введите наименование товара.",
+        "specs": "⚙️ Введите технические характеристики.",
+        "brand": "🏷️ Введите марку устройства или аналог.",
+        "qty": "🔢 Введите количество.",
+        "unit": "📏 Введите единицу измерения.",
+        "link": "🔗 Введите ссылку на товар (можно несколько строк).",
+        "note": "📝 Введите примечание (при необходимости).",
     }
-    prompt = prompts.get(field, "Введите значение.")
+    prompt = prompts.get(field, "✏️ Введите значение.")
     await _show_input_prompt(
         callback.bot,
         state,
@@ -1828,6 +1958,21 @@ async def request_item_back(callback: CallbackQuery, state: FSMContext) -> None:
 async def request_item_attach_done(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     item_index = data.get("current_item_index")
+    manual_wizard = data.get("manual_wizard") and data.get("request_method") == "manual"
+    if manual_wizard:
+        await state.set_state(RequestCreate.menu)
+        await state.update_data(input_target=None)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+        item_label = f"Товар {item_index + 1}" if item_index is not None else "Товар"
+        await callback.message.answer(
+            f"✅ {item_label} сохранен. Добавить еще товар?",
+            reply_markup=_manual_item_more_keyboard(),
+        )
+        await callback.answer()
+        return
     await state.set_state(RequestCreate.menu)
     if item_index is not None:
         await _show_item_editor(
@@ -1857,10 +2002,28 @@ async def request_item_attach_clear(callback: CallbackQuery, state: FSMContext) 
     await callback.answer()
 
 
-@router.callback_query(RequestCreate.item_attachment, F.data == "req_item_attach_back")
+@router.callback_query(
+    RequestCreate.item_attachment,
+    F.data.in_({"req_item_attach_back", "req_item_attach_skip"}),
+)
 async def request_item_attach_back(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     item_index = data.get("current_item_index")
+    manual_wizard = data.get("manual_wizard") and data.get("request_method") == "manual"
+    if manual_wizard:
+        await state.set_state(RequestCreate.menu)
+        await state.update_data(input_target=None)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+        item_label = f"Товар {item_index + 1}" if item_index is not None else "Товар"
+        await callback.message.answer(
+            f"➡️ {item_label}: вложения пропущены. Добавить еще товар?",
+            reply_markup=_manual_item_more_keyboard(),
+        )
+        await callback.answer()
+        return
     await state.set_state(RequestCreate.menu)
     if item_index is not None:
         await _show_item_editor(
@@ -1914,7 +2077,10 @@ async def request_item_attachment(message: Message, state: FSMContext) -> None:
         item["attachments"] = attachments
         items[item_index] = item
         await state.update_data(items=items)
-        await message.answer("Фото добавлено. Можно отправить еще или нажмите «Готово».")
+        await message.answer(
+            "Фото добавлено. Можно отправить еще или нажмите «Готово» / «Пропустить».",
+            reply_markup=_attachments_keyboard(),
+        )
         await _try_delete_message(message)
         return
     if message.document:
@@ -1950,7 +2116,10 @@ async def request_item_attachment(message: Message, state: FSMContext) -> None:
             item["attachments"] = attachments
             items[item_index] = item
             await state.update_data(items=items)
-            await message.answer("Фото добавлено. Можно отправить еще или нажмите «Готово».")
+            await message.answer(
+                "Фото добавлено. Можно отправить еще или нажмите «Готово» / «Пропустить».",
+                reply_markup=_attachments_keyboard(),
+            )
             await _try_delete_message(message)
             return
         doc = message.document
@@ -1965,7 +2134,10 @@ async def request_item_attachment(message: Message, state: FSMContext) -> None:
         item["attachments"] = attachments
         items[item_index] = item
         await state.update_data(items=items)
-        await message.answer("Файл добавлен. Можно отправить еще или нажмите «Готово».")
+        await message.answer(
+            "Файл добавлен. Можно отправить еще или нажмите «Готово» / «Пропустить».",
+            reply_markup=_attachments_keyboard(),
+        )
         await _try_delete_message(message)
         return
     if message.text:
@@ -1977,10 +2149,16 @@ async def request_item_attachment(message: Message, state: FSMContext) -> None:
         item["link"] = current
         items[item_index] = item
         await state.update_data(items=items)
-        await message.answer("Ссылка сохранена. Можно отправить еще или нажмите «Готово».")
+        await message.answer(
+            "Ссылка сохранена. Можно отправить еще или нажмите «Готово» / «Пропустить».",
+            reply_markup=_attachments_keyboard(),
+        )
         await _try_delete_message(message)
         return
-    await message.answer("Отправьте фото, файл или ссылку, либо нажмите «Готово».")
+    await message.answer(
+        "Отправьте фото, файл или ссылку, либо нажмите «Готово» / «Пропустить».",
+        reply_markup=_attachments_keyboard(),
+    )
     await _try_delete_message(message)
 
 
@@ -2027,34 +2205,201 @@ async def request_input_clear(callback: CallbackQuery, state: FSMContext) -> Non
     await callback.answer()
 
 
+@router.callback_query(StateFilter(RequestCreate), F.data.startswith("item_more:"))
+async def request_item_more(callback: CallbackQuery, state: FSMContext) -> None:
+    action = callback.data.split(":")[1]
+    data = await state.get_data()
+    if not (data.get("manual_wizard") and data.get("request_method") == "manual"):
+        await callback.answer()
+        return
+    if action == "yes":
+        items = data.get("items") or []
+        items.append({"attachments": []})
+        item_index = len(items) - 1
+        await state.update_data(
+            items=items,
+            current_item_index=item_index,
+            input_target="item_name",
+        )
+        await state.set_state(RequestCreate.text_input)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+        await callback.message.answer(f"🧾 Товар {item_index + 1}: введите наименование.")
+        await callback.answer()
+        return
+    if action == "no":
+        errors = _validate_manual_request(data)
+        if errors:
+            await callback.message.answer("⚠️ Нужно заполнить: " + ", ".join(errors))
+            await callback.answer()
+            return
+        request = await _create_request(callback.bot, data, callback.from_user, callback.message)
+        if request:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                pass
+            await callback.message.answer("✅ Заявка создана.")
+            await state.clear()
+        await callback.answer()
+        return
+    await callback.answer()
+
+
 @router.message(RequestCreate.text_input)
 async def request_text_input(message: Message, state: FSMContext) -> None:
     if not message.text:
-        await message.answer("Нужно отправить текст.")
+        await message.answer("✍️ Нужно отправить текст.")
         await _try_delete_message(message)
         return
     data = await state.get_data()
     target = data.get("input_target")
+    is_manual_wizard = data.get("manual_wizard") and data.get("request_method") == "manual"
+    skip_values = {"-", "—", "нет", "пропустить", "skip"}
+    value = message.text.strip()
+
+    if is_manual_wizard:
+        if target == "mol_full_name":
+            if not value:
+                await message.answer("👤 Введите ФИО МОЛ.")
+                await _try_delete_message(message)
+                return
+            await state.update_data(mol_full_name=value, input_target="contract_max_price")
+            await message.answer(
+                "💰 Шаг 4/6. Введите начальную (максимальную) цену договора в тыс. руб.\n"
+                "Если поле не требуется, отправьте «-»."
+            )
+            await _try_delete_message(message)
+            return
+        if target == "contract_max_price":
+            parsed_value = None if value.casefold() in skip_values else value
+            await state.update_data(
+                contract_max_price=parsed_value,
+                input_target="bdds_article_category",
+            )
+            await message.answer(
+                "📑 Шаг 5/6. Введите БДДС (Статья ДДС - Товарная категория).\n"
+                "Если поле не требуется, отправьте «-»."
+            )
+            await _try_delete_message(message)
+            return
+        if target == "bdds_article_category":
+            parsed_value = None if value.casefold() in skip_values else value
+            items = data.get("items") or []
+            if not items:
+                items = [{"attachments": []}]
+            await state.update_data(
+                bdds_article_category=parsed_value,
+                items=items,
+                current_item_index=0,
+                input_target="item_name",
+            )
+            await message.answer("🧾 Шаг 6/6. Товар 1: введите наименование.")
+            await _try_delete_message(message)
+            return
+        if target and target.startswith("item_"):
+            items = data.get("items") or []
+            item_index = data.get("current_item_index")
+            if item_index is None or item_index >= len(items):
+                await message.answer("Не удалось определить товар. Начните создание заявки заново.")
+                await _try_delete_message(message)
+                return
+            field = target.replace("item_", "")
+            if field in {"name", "qty", "unit"} and not value:
+                await message.answer("⚠️ Поле не может быть пустым. Введите значение.")
+                await _try_delete_message(message)
+                return
+            parsed_value = value
+            if field in {"specs", "brand", "link", "note"} and value.casefold() in skip_values:
+                parsed_value = None
+            item = items[item_index]
+            item[field] = parsed_value
+            items[item_index] = item
+            if field == "name":
+                await state.update_data(items=items, input_target="item_specs")
+                await message.answer(
+                    f"⚙️ Товар {item_index + 1}: введите технические характеристики.\n"
+                    "Если поле не требуется, отправьте «-»."
+                )
+                await _try_delete_message(message)
+                return
+            if field == "specs":
+                await state.update_data(items=items, input_target="item_brand")
+                await message.answer(
+                    f"🏷️ Товар {item_index + 1}: введите марку/аналог.\n"
+                    "Если поле не требуется, отправьте «-»."
+                )
+                await _try_delete_message(message)
+                return
+            if field == "brand":
+                await state.update_data(items=items, input_target="item_qty")
+                await message.answer(f"🔢 Товар {item_index + 1}: введите количество.")
+                await _try_delete_message(message)
+                return
+            if field == "qty":
+                await state.update_data(items=items, input_target="item_unit")
+                await message.answer(f"📏 Товар {item_index + 1}: введите единицу измерения.")
+                await _try_delete_message(message)
+                return
+            if field == "unit":
+                await state.update_data(items=items, input_target="item_link")
+                await message.answer(
+                    f"🔗 Товар {item_index + 1}: введите ссылку на товар.\n"
+                    "Если поле не требуется, отправьте «-»."
+                )
+                await _try_delete_message(message)
+                return
+            if field == "link":
+                await state.update_data(items=items, input_target="item_note")
+                await message.answer(
+                    f"📝 Товар {item_index + 1}: введите примечание.\n"
+                    "Если поле не требуется, отправьте «-»."
+                )
+                await _try_delete_message(message)
+                return
+            if field == "note":
+                await state.update_data(items=items, input_target=None)
+                await state.set_state(RequestCreate.item_attachment)
+                await _show_attachment_prompt(
+                    message.bot,
+                    state,
+                    item_index,
+                    fallback_message=message,
+                )
+                await message.answer(
+                    (
+                        f"📎 Товар {item_index + 1} заполнен. "
+                        "Прикрепите фото/файл или нажмите «Готово» / «Пропустить»."
+                    ),
+                    reply_markup=_attachments_keyboard(),
+                )
+                await _try_delete_message(message)
+                return
+            await message.answer("Не удалось распознать поле товара. Начните создание заявки заново.")
+            await _try_delete_message(message)
+            return
+        await message.answer("Не удалось распознать шаг заполнения. Начните создание заявки заново.")
+        await _try_delete_message(message)
+        return
+
     if target == "mol_full_name":
-        await state.update_data(mol_full_name=message.text.strip())
+        await state.update_data(mol_full_name=value)
         await state.set_state(RequestCreate.menu)
         await _show_request_menu(message.bot, state, fallback_message=message)
         await _try_delete_message(message)
         return
     if target == "contract_max_price":
-        value = message.text.strip()
-        if value.casefold() in {"-", "—", "нет", "пропустить", "skip"}:
-            value = None
-        await state.update_data(contract_max_price=value)
+        parsed_value = None if value.casefold() in skip_values else value
+        await state.update_data(contract_max_price=parsed_value)
         await state.set_state(RequestCreate.menu)
         await _show_request_menu(message.bot, state, fallback_message=message)
         await _try_delete_message(message)
         return
     if target == "bdds_article_category":
-        value = message.text.strip()
-        if value.casefold() in {"-", "—", "нет", "пропустить", "skip"}:
-            value = None
-        await state.update_data(bdds_article_category=value)
+        parsed_value = None if value.casefold() in skip_values else value
+        await state.update_data(bdds_article_category=parsed_value)
         await state.set_state(RequestCreate.menu)
         await _show_request_menu(message.bot, state, fallback_message=message)
         await _try_delete_message(message)
@@ -2068,7 +2413,6 @@ async def request_text_input(message: Message, state: FSMContext) -> None:
             return
         field = target.replace("item_", "")
         item = items[item_index]
-        value = message.text.strip()
         if field == "link":
             current = _normalize_text(item.get("link"))
             if current:
@@ -2098,7 +2442,7 @@ async def request_submit(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     request = await _create_request(
-        callback.bot, data, data["approver_id"], callback.from_user, callback.message
+        callback.bot, data, callback.from_user, callback.message
     )
     if request:
         await _edit_request_message(

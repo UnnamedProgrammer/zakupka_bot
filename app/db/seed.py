@@ -2,8 +2,6 @@ from sqlalchemy import select
 
 from app.db.models import (
     ApprovalStatus,
-    Cfo,
-    Department,
     RequestStatus,
     Role,
     User,
@@ -33,44 +31,16 @@ APPROVAL_STATUS_DATA = [
     {"code": "rejected", "name": "Отклонено"},
 ]
 
-DEPARTMENT_DATA = [
-    "АКБ СААЖ",
-    "ИЭБ СААЖ",
-    "Проектный модуль СААЖ",
-    "Организационный модуль СААЖ",
-    "Блок питания СААЖ",
-    "СПА-салон",
-]
-
-CFO_DATA = [
-    "Коттеджный поселок «Три медведя»",
-    "Пирамида",
-    "Хостелы",
-    "СААЖ Южный парк (ОЭЗ)",
-    "СААЖ Южный парк 2",
-    "СААЖ ИО",
-    "СААЖ Европа",
-    "СААЖ Каллисто",
-    "СААЖ Ганимед",
-    "СААЖ Клининговый блок",
-    "СПА-салон",
-    "Блок питания – Якитория",
-    "Блок питания – Яковлев",
-    "Отдел организации питания – Магазин",
-    "Отдел организации питания – Шоколадница",
-    "Служба администрирования арендного жилья",
-]
-
 DEFAULT_USERS = [
     {
         "full_name": "Гайнутдинов Руслан Фаргатович",
         "role_code": "approver",
-        "is_default_approver": True,
+        "is_default_approver": False,
     },
     {
         "full_name": "Тихонова Людмила Васильевна",
         "role_code": "approver",
-        "is_default_approver": True,
+        "is_default_approver": False,
     },
     {"full_name": "Ковалев Д.А.", "role_code": "approver"},
     {
@@ -78,18 +48,12 @@ DEFAULT_USERS = [
         "role_code": "approver",
         "is_default_approver": True,
     },
-    {"full_name": "Губайдуллин Рамиль Рашитович", "role_code": "executor"},
-    {"full_name": "Азизова Амира Фаридовна", "role_code": "executor"},
-    {"full_name": "Шаймарданова Алина Рашидовна", "role_code": "executor"},
-    {"full_name": "Зарипов Инсаф Илфакович", "role_code": "executor"},
 ]
 
 
 async def seed_reference_data(session) -> None:
     await _seed_roles(session)
     await _seed_statuses(session)
-    await _seed_departments(session)
-    await _seed_cfos(session)
     await _seed_default_users(session)
     await session.commit()
 
@@ -111,20 +75,6 @@ async def _seed_statuses(session) -> None:
     for item in APPROVAL_STATUS_DATA:
         if item["code"] not in app_existing:
             session.add(ApprovalStatus(**item))
-
-
-async def _seed_departments(session) -> None:
-    existing = {row[0] for row in (await session.execute(select(Department.name))).all()}
-    for name in DEPARTMENT_DATA:
-        if name not in existing:
-            session.add(Department(name=name))
-
-
-async def _seed_cfos(session) -> None:
-    existing = {row[0] for row in (await session.execute(select(Cfo.name))).all()}
-    for name in CFO_DATA:
-        if name not in existing:
-            session.add(Cfo(name=name))
 
 
 async def _seed_default_users(session) -> None:

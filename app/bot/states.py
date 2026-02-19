@@ -25,6 +25,10 @@ class ExecutorComment(StatesGroup):
     comment = State()
 
 
+class ExtraApprovalComment(StatesGroup):
+    comment = State()
+
+
 class ExecutorFile(StatesGroup):
     file = State()
 

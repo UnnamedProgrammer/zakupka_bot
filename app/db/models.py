@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, String, Text, Table, Column
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    String,
+    Text,
+    Table,
+    Column,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -132,7 +142,11 @@ class User(Base):
         foreign_keys="Request.executor_id",
         lazy="raise",
     )
-    approvals: Mapped[list["Approval"]] = relationship(back_populates="approver", lazy="raise")
+    approvals: Mapped[list["Approval"]] = relationship(
+        back_populates="approver",
+        foreign_keys="Approval.approver_id",
+        lazy="raise",
+    )
     comments: Mapped[list["Comment"]] = relationship(back_populates="author", lazy="raise")
     attachments: Mapped[list["Attachment"]] = relationship(back_populates="uploader", lazy="raise")
 
@@ -229,6 +243,8 @@ class Approval(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     request_id: Mapped[int] = mapped_column(ForeignKey("requests.id"), nullable=False)
+    kind: Mapped[str | None] = mapped_column(String(50))
+    requested_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     approver_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     status_id: Mapped[int] = mapped_column(ForeignKey("approval_statuses.id"), nullable=False)
     comment: Mapped[str | None] = mapped_column(Text)
@@ -236,7 +252,11 @@ class Approval(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
     request: Mapped["Request"] = relationship(back_populates="approvals", lazy="raise")
-    approver: Mapped["User"] = relationship(back_populates="approvals", lazy="raise")
+    approver: Mapped["User"] = relationship(
+        back_populates="approvals",
+        foreign_keys=[approver_id],
+        lazy="raise",
+    )
     status: Mapped["ApprovalStatus"] = relationship(back_populates="approvals", lazy="raise")
 
 
