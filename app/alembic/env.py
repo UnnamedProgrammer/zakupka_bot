@@ -11,7 +11,9 @@ from app.db.base import Base  # noqa: E402
 from app.db import models  # noqa: F401,E402
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url.replace("+asyncpg", ""))
+sync_database_url = settings.database_url.replace("+asyncpg", "")
+# ConfigParser treats "%" as interpolation marker, so escape it for Alembic config.
+config.set_main_option("sqlalchemy.url", sync_database_url.replace("%", "%%"))
 
 target_metadata = Base.metadata
 

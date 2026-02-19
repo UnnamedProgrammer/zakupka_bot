@@ -25,32 +25,35 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _ensure_database_url(self):
+        pg_values = (
+            ("POSTGRES_DB", self.postgres_db),
+            ("POSTGRES_USER", self.postgres_user),
+            ("POSTGRES_PASSWORD", self.postgres_password),
+            ("POSTGRES_HOST", self.postgres_host),
+            ("POSTGRES_PORT", self.postgres_port),
+        )
+        pg_missing = [name for name, value in pg_values if value in ("", None)]
+
+        # Prefer explicit POSTGRES_* variables and build URL in code from them.
+        if not pg_missing:
+            user = quote_plus(str(self.postgres_user))
+            password = quote_plus(str(self.postgres_password))
+            host = str(self.postgres_host)
+            port = int(self.postgres_port)
+            db_name = quote_plus(str(self.postgres_db))
+            self.database_url = (
+                f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}"
+            )
+            return self
+
         if self.database_url:
             return self
 
-        missing = [
-            name
-            for name, value in (
-                ("POSTGRES_DB", self.postgres_db),
-                ("POSTGRES_USER", self.postgres_user),
-                ("POSTGRES_PASSWORD", self.postgres_password),
-                ("POSTGRES_HOST", self.postgres_host),
-                ("POSTGRES_PORT", self.postgres_port),
-            )
-            if value in ("", None)
-        ]
-        if missing:
-            joined = ", ".join(missing)
-            raise ValueError(
-                f"Set DATABASE_URL or provide PostgreSQL variables in .env: {joined}."
-            )
+        joined = ", ".join(pg_missing)
+        raise ValueError(
+            f"Set POSTGRES_* variables or DATABASE_URL in .env. Missing: {joined}."
+        )
 
-        user = quote_plus(str(self.postgres_user))
-        password = quote_plus(str(self.postgres_password))
-        host = str(self.postgres_host)
-        port = int(self.postgres_port)
-        db_name = quote_plus(str(self.postgres_db))
-        self.database_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db_name}"
         return self
 
     model_config = SettingsConfigDict(
