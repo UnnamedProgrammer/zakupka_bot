@@ -654,13 +654,13 @@ async def my_requests(message: Message, state: FSMContext) -> None:
         )
         role_codes = await get_user_role_codes(session, user.id)
     await state.clear()
-    if "approver" in role_codes or user.is_default_approver:
-        await _show_leader_list(message, user.id, page=1, edit=False, state=state)
-        return
-    if "executor" in role_codes:
+    if "executor" in role_codes and "admin" not in role_codes:
         from app.bot.handlers.executor import _show_my_list  # local import to avoid cycles
 
         await _show_my_list(message, user.id, page=1, edit=False, state=state)
+        return
+    if "approver" in role_codes or user.is_default_approver:
+        await _show_leader_list(message, user.id, page=1, edit=False, state=state)
         return
     await _show_initiator_list(message, user.id, page=1, edit=False, state=state)
 

@@ -444,6 +444,10 @@ async def _is_executor(session, user_id: int) -> bool:
     return await user_has_role(session, user_id, "executor")
 
 
+async def _is_admin(session, user_id: int) -> bool:
+    return await user_has_role(session, user_id, "admin")
+
+
 async def _get_user(session, tg_user) -> User:
     username = await ensure_username_format(tg_user.username)
     user = await get_or_create_user(session, tg_user.id, username, tg_user.full_name)
@@ -1128,8 +1132,8 @@ async def delivery_list(callback: CallbackQuery, state: FSMContext) -> None:
     page = int(page_str) if page_str.isdigit() else 1
     async with SessionLocal() as session:
         user = await _get_user(session, callback.from_user)
-        if not await _is_executor(session, user.id):
-            await callback.answer("Доступно только исполнителям.")
+        if not await _is_admin(session, user.id):
+            await callback.answer("Доступно только администраторам.")
             return
     await state.clear()
     await _show_delivery_list(
@@ -1149,8 +1153,8 @@ async def delivery_pick(callback: CallbackQuery, state: FSMContext) -> None:
     page = int(page_str) if page_str.isdigit() else 1
     async with SessionLocal() as session:
         user = await _get_user(session, callback.from_user)
-        if not await _is_executor(session, user.id):
-            await callback.answer("Доступно только исполнителям.")
+        if not await _is_admin(session, user.id):
+            await callback.answer("Доступно только администраторам.")
             return
         request = await session.get(
             Request,
@@ -1286,8 +1290,8 @@ async def export_daily_requests(message: Message, state: FSMContext) -> None:
         user = await get_or_create_user(
             session, message.from_user.id, username, message.from_user.full_name
         )
-        if not await _is_executor(session, user.id):
-            await message.answer("Доступно только исполнителям.")
+        if not await _is_admin(session, user.id):
+            await message.answer("Доступно только администраторам.")
             return
     await state.clear()
     await _show_daily_list(message, page=1, edit=False)
@@ -1299,8 +1303,8 @@ async def daily_list(callback: CallbackQuery, state: FSMContext) -> None:
     page = int(page_str) if page_str.isdigit() else 1
     async with SessionLocal() as session:
         user = await _get_user(session, callback.from_user)
-        if not await _is_executor(session, user.id):
-            await callback.answer("Доступно только исполнителям.")
+        if not await _is_admin(session, user.id):
+            await callback.answer("Доступно только администраторам.")
             return
     await state.clear()
     await _show_daily_list(callback.message, page=page, edit=True)
@@ -1313,8 +1317,8 @@ async def daily_pick(callback: CallbackQuery) -> None:
     request_id = int(request_id)
     async with SessionLocal() as session:
         user = await _get_user(session, callback.from_user)
-        if not await _is_executor(session, user.id):
-            await callback.answer("Доступно только исполнителям.")
+        if not await _is_admin(session, user.id):
+            await callback.answer("Доступно только администраторам.")
             return
         request = await session.get(
             Request,
@@ -1356,6 +1360,13 @@ async def daily_pick(callback: CallbackQuery) -> None:
 async def export_employee_stats(message: Message, state: FSMContext) -> None:
     await cleanup_main_menu(message, state)
     async with SessionLocal() as session:
+        username = await ensure_username_format(message.from_user.username)
+        user = await get_or_create_user(
+            session, message.from_user.id, username, message.from_user.full_name
+        )
+        if not await _is_admin(session, user.id):
+            await message.answer("Доступно только администраторам.")
+            return
         rows = await session.execute(
             select(Request)
             .options(
@@ -1422,8 +1433,8 @@ async def export_edit_upload(message: Message, state: FSMContext) -> None:
         return
     async with SessionLocal() as session:
         user = await _get_user(session, message.from_user)
-        if not await _is_executor(session, user.id):
-            await message.answer("Доступно только исполнителям.")
+        if not await _is_admin(session, user.id):
+            await message.answer("Доступно только администраторам.")
             await state.clear()
             return
 
@@ -1613,8 +1624,8 @@ async def delivery_menu(message: Message, state: FSMContext) -> None:
         user = await get_or_create_user(
             session, message.from_user.id, username, message.from_user.full_name
         )
-        if not await _is_executor(session, user.id):
-            await message.answer("Доступно только исполнителям.")
+        if not await _is_admin(session, user.id):
+            await message.answer("Доступно только администраторам.")
             return
     await state.clear()
     await _show_delivery_list(message, user.id, filter_key="missing", page=1, edit=False)

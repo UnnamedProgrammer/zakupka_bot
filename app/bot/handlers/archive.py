@@ -535,9 +535,13 @@ async def archive_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     async with SessionLocal() as session:
         username = await ensure_username_format(message.from_user.username)
-        await get_or_create_user(
+        user = await get_or_create_user(
             session, message.from_user.id, username, message.from_user.full_name
         )
+        role_codes = await get_user_role_codes(session, user.id)
+        if "admin" not in role_codes:
+            await message.answer("Доступно только администраторам.")
+            return
     await state.set_state(ArchiveFilter.menu)
     sent = await message.answer(
         _archive_menu_text({}),
@@ -548,6 +552,15 @@ async def archive_start(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "arch_menu")
 async def archive_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    async with SessionLocal() as session:
+        username = await ensure_username_format(callback.from_user.username)
+        user = await get_or_create_user(
+            session, callback.from_user.id, username, callback.from_user.full_name
+        )
+        role_codes = await get_user_role_codes(session, user.id)
+        if "admin" not in role_codes:
+            await callback.answer("Нет доступа")
+            return
     await state.set_state(ArchiveFilter.menu)
     await _show_archive_menu(callback.bot, state, fallback_message=callback.message)
     await callback.answer()
@@ -908,8 +921,8 @@ async def archive_edit_upload(message: Message, state: FSMContext) -> None:
             session, message.from_user.id, username, message.from_user.full_name
         )
         roles = await get_user_role_codes(session, user.id)
-        if not roles.intersection({"executor", "admin"}):
-            await message.answer("Доступно только исполнителям или администраторам.")
+        if "admin" not in roles:
+            await message.answer("Доступно только администраторам.")
             await state.set_state(ArchiveFilter.menu)
             return
 

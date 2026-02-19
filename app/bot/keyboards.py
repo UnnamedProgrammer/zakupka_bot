@@ -5,17 +5,20 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 def main_menu_keyboard(role_codes) -> ReplyKeyboardMarkup:
     codes = {role_codes} if isinstance(role_codes, str) else set(role_codes or [])
     builder = ReplyKeyboardBuilder()
-    builder.button(text="📝 Создать заявку")
     builder.button(text="📥 Скачать шаблон заявки")
-    builder.button(text="📚 Архив")
-    if codes:
+
+    if "admin" in codes:
+        builder.button(text="📝 Создать заявку")
+        builder.button(text="📚 Архив")
         builder.button(text="📌 Мои заявки")
-    if "executor" in codes:
         builder.button(text="📤 Выгрузить ежедневные заявки")
         builder.button(text="📊 Выгрузить статистику сотрудников")
         builder.button(text="📅 Срок поставки")
-    if "admin" in codes:
         builder.button(text="⚙️ Настройки")
+    else:
+        builder.button(text="📝 Создать заявку")
+        builder.button(text="📌 Мои заявки")
+
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
