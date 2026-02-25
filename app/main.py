@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+from app.bot.access import AccessByUsernameMiddleware
 from app.bot.router import setup_router
 from app.config import settings
 from app.db.seed import seed_reference_data
@@ -52,6 +53,9 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=MemoryStorage())
+    access = AccessByUsernameMiddleware()
+    dp.message.outer_middleware(access)
+    dp.callback_query.outer_middleware(access)
     dp.include_router(setup_router())
     dp.startup.register(on_startup)
     await dp.start_polling(bot)

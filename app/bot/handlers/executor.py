@@ -481,11 +481,6 @@ async def _resolve_override_executor(session) -> User | None:
             override_user = await session.scalar(
                 select(User).where(User.tg_username == username)
             )
-    if not override_user and settings.approval_override_tg_id:
-        username = await ensure_username_format(settings.approval_override_username)
-        override_user = await get_or_create_user(
-            session, settings.approval_override_tg_id, username, None
-        )
     return override_user
 
 
